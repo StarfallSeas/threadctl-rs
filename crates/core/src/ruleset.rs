@@ -497,6 +497,19 @@ mod tests {
         }
     }
 
+    /// 包级 sched-only 规则（白名单占位：无 cpus）。
+    fn rc_sched_only(pkg: &str, sched: &str) -> RuleConfig {
+        RuleConfig {
+            pkg: pkg.into(),
+            thread: String::new(),
+            cpus: String::new(),
+            sched: Some(sched.into()),
+            nice: None,
+            uclamp_min: None,
+            uclamp_max: None,
+        }
+    }
+
     fn topo() -> CpuTopology {
         let mut t = CpuTopology::default();
         for i in 0..8 {
@@ -706,5 +719,25 @@ mod tests {
 
         let p = rs.resolve("com.tencent.qq", "RenderThread").expect("resolve");
         assert_eq!(p.cpus.to_range_string(), "7", "线程规则优先");
+    }
+
+    #[test]
+    fn empty_policy_returns_none() {
+        // ChatGPT P6.2 审查 Q3：真正空规则（无 cpus/sched/nice）→ None
+        let rules = vec![rc("com.empty", "")];
+        let rs = RuleSet::compile(&rules, &topo()).rules;
+        assert!(rs.resolve("com.empty", "").is_none(), "空规则应返回 None（系统默认）");
+    }
+
+    #[test]
+    fn partial_policy_returns_some() {
+        // ChatGPT P6.2 审查 Q3：部分规则（仅 sched）→ Some（白名单占位语义，
+        // 仅应用调度属性，cpus 保持空）
+        let rules = vec![rc_sched_only("com.partial", "fifo:60")];
+        let rs = RuleSet::compile(&rules, &topo()).rules;
+        let p = rs.resolve("com.partial", "").expect("部分规则应返回 Some");
+        assert_eq!(p.sched, Some(crate::policy::SchedPolicy::Fifo));
+        assert_eq!(p.sched_prio, Some(60));
+        assert_eq!(p.cpus.count(), 0, "sched-only 规则不约束 CPU");
     }
 }

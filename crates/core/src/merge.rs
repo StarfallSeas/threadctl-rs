@@ -58,7 +58,10 @@ pub const MERGE_TABLE: &[( &str, MergeStrategy )] = &[
 /// - Constraints (uclamp): Max/Min accumulate **globally** across all sources.
 pub(crate) fn merge_rules(matches: &[RuleMatch], rules: &[CompiledRule]) -> Option<Policy> {
     let mut sorted: Vec<&RuleMatch> = matches.iter().collect();
-    // Explicit priority table (GPT V3: avoid relying on enum Ord ordering)
+    // Self-contained ordering (ChatGPT P6.2 review Q4): never rely on the
+    // matcher's output order — future sources (Profile/Group/Runtime) may
+    // change how collect_pkg_matches emits RuleMatches. Merge sorts by
+    // explicit priority() table internally.
     sorted.sort_by_key(|m| std::cmp::Reverse(m.source.priority()));
 
     let mut cpus = CpuSet::new();
