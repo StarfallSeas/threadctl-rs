@@ -9,6 +9,15 @@
 > Think of it as **a systemd policy engine for Android application threads**:
 > systemd manages services, this manages how threads run.
 
+> ## What threadctl-rs is not
+>
+> - does **not** kill apps
+> - does **not** freeze processes
+> - does **not** replace Android LMKD (memory management)
+> - does **not** replace the Linux scheduler
+>
+> It only applies explicit user-defined thread policies (affinity / sched / uclamp).
+
 ```text
 Application Threads
         ↓

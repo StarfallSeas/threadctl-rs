@@ -9,6 +9,15 @@
 > 可以理解为 **Android 应用线程级的 systemd policy engine**：systemd 管理服务，
 > 它管理线程怎么跑。
 
+> ## threadctl-rs 不是什么（What it is not）
+>
+> - **不杀后台进程**（kill apps）
+> - **不冻结进程**（freeze processes）
+> - **不取代 Android LMKD**（内存管理）
+> - **不取代 Linux 调度器**（scheduler）
+>
+> 只应用用户显式定义的线程策略（亲和性 / 调度 / uclamp 约束）。
+
 ```text
 Application Threads
         ↓
