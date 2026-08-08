@@ -15,11 +15,11 @@ use threadctl_core::capability::CapabilitySet;
 use threadctl_core::caps::can_rt_sched;
 use threadctl_core::config::ConfigSnapshot;
 use threadctl_core::decision::{DecisionEngine, MigrateAction};
-use threadctl_core::engine;
+use threadctl_core::engine::{self, RelockContext};
 use threadctl_core::event::EventSource;
 use threadctl_core::foreground::refresh_foreground_uids;
 use threadctl_core::store::{spawn_hot_reload, ConfigStore};
-use threadctl_core::system_context::{AdaptivePoller, SystemContext};
+use threadctl_core::system_context::{AdaptivePoller, PressureLevel, SystemContext};
 use threadctl_core::topology::init_cpu_topo;
 use threadctl_core::tracker::StateTracker;
 
@@ -156,6 +156,22 @@ fn main() {
     let mut last_audit = now_secs();
     let mut sys_ctx_poller = AdaptivePoller::new();
 
+    // P6.2-2：最近一次 SystemContext 快照（relock 决策的 fast 信号输入）。
+    let mut last_sys: Option<SystemContext> = None;
+
+    // 组装 relock 决策上下文（fast: pressure/thermal + slow: audit failure rate）。
+    let build_relock_ctx = |last_sys: &Option<SystemContext>| -> RelockContext {
+        let (pressure, thermal) = match last_sys {
+            Some(s) => (s.memory_pressure, s.thermal_pressure),
+            None => (PressureLevel::Normal, 0.0),
+        };
+        RelockContext {
+            pressure,
+            thermal_pressure: thermal,
+            audit_failure_rate: audit::summary_windowed(60).failure_rate(),
+        }
+    };
+
     println!("threadctl-rs v{} started (P2: proc event pipeline)", env!("CARGO_PKG_VERSION"));
 
     loop {
@@ -169,7 +185,7 @@ fn main() {
             {
                 let mut t = lock_tracker(&tracker);
                 t.retain_interested(&pkg_set(&cfg));
-                let n = engine::relock_all(&mut t, &cfg, &topo, now);
+                let n = engine::relock_all(&mut t, &cfg, &topo, now, &build_relock_ctx(&last_sys), &decision_engine);
                 println!("config change rescan done: applied {n} threads");
             }
         }
@@ -177,7 +193,7 @@ fn main() {
         // ── relock 周期锁定（对抗 Android 侧覆盖）──
         let lock_interval = cfg.engine.lock_interval;
         if lock_interval > 0 && now - last_lock >= lock_interval as i64 {
-            let n = engine::relock_all(&mut lock_tracker(&tracker), &cfg, &topo, now);
+            let n = engine::relock_all(&mut lock_tracker(&tracker), &cfg, &topo, now, &build_relock_ctx(&last_sys), &decision_engine);
             last_lock = now;
             if n > 0 {
                 println!("relock: re-applied {n} threads");
@@ -212,6 +228,8 @@ fn main() {
                 println!("SystemContext: {}", ctx.summary());
             }
             sys_ctx_poller.sampled(&ctx);
+            // P6.2-2：保存快照供 relock 决策（fast 信号）
+            last_sys = Some(ctx);
         }
 
         // ── M4 接入：前台 UID 缓存刷新（30s）──

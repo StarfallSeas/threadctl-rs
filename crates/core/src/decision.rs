@@ -149,9 +149,111 @@ pub enum MigrateAction {
     Force,
 }
 
+// ────────────────────────────────────────────────────────────────
+// P6.2-2: 正式决策接口（ChatGPT P6.2 审查：Decision 带原因，
+// DecisionEngine 不读 proc，多时间尺度 Context）
+// ────────────────────────────────────────────────────────────────
+
+/// 决策原因（audit 可解释：Measure → Adjust 闭环需要知道"为什么"）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reason {
+    /// 前台交互进程，正常干预
+    ForegroundInteractive,
+    /// 后台进程（不干预，省电 + 交还调度器）
+    Background,
+    /// 冻结进程（永不干预）
+    Frozen,
+    /// 热压力（冷却设备使用率高，避免多余唤醒/迁移）
+    ThermalPressure,
+    /// 内存压力（Critical，压力感知降级）
+    MemoryPressure,
+    /// 审计失败率高（重应用大概率再失败，先观察记录）
+    AuditFailureRate,
+    /// 用户显式强制（force_affinity）
+    ForceAffinity,
+}
+
+/// 降级级别（relock 场景：Skip 与 Degrade 都跳过本轮重应用，区别在记录）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum DegradeLevel {
+    /// 本轮跳过，下轮再试
+    SkipOnce,
+    /// 观察（持续记录，不干预）
+    Observe,
+    /// 降低干预强度（relock 层 = 暂不重应用）
+    Relax,
+}
+
+/// 正式决策结果（带原因，ChatGPT P6.2 审查）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Decision {
+    Allow { reason: Reason },
+    Skip { reason: Reason },
+    Degrade { level: DegradeLevel, reason: Reason },
+}
+
+/// 决策上下文（多时间尺度，ChatGPT P6.2 审查）：
+/// - fast (1-5s)：pressure / foreground / thermal（突发事件）
+/// - slow (30-60s)：audit failure rate（趋势）
+/// 由调用方（engine/daemon）组装——DecisionEngine 本身不读 proc。
+#[derive(Debug, Clone)]
+pub struct DecisionContext {
+    pub intent: TaskIntent,
+    /// fast：内存压力等级
+    pub pressure: PressureLevel,
+    /// fast：冷却设备使用率 0.0~1.0
+    pub thermal_pressure: f64,
+    /// fast：是否前台（engine 用 intent==Interactive 近似，pid→uid 映射后续）
+    pub foreground: bool,
+    /// slow：审计失败率 0.0~1.0（窗口由调用方决定，默认 60s）
+    pub audit_failure_rate: f64,
+}
+
+impl DecisionEngine {
+    /// 正式决策入口（P6.2-2）：DecisionEngine = gate（Allow/Skip/Degrade），
+    /// 不直接返回 Policy（ChatGPT P6.2 约束——避免决策侵入配置层）。
+    ///
+    /// 语义（relock 场景）：
+    /// - Frozen / Background → Skip（永不干预 / 省电交还调度器）
+    /// - 热压力 > 0.8 → Degrade(Relax)（避免多余唤醒/迁移）
+    /// - 审计失败率 > 50% → Degrade(Observe)（大概率再失败，先观察）
+    /// - 内存压力 Critical → Degrade(Relax)（压力感知降级）
+    /// - 否则 → Allow（正常干预）
+    pub fn decide_ctx(&self, ctx: &DecisionContext) -> Decision {
+        if self.force_affinity_enabled {
+            return Decision::Allow { reason: Reason::ForceAffinity };
+        }
+        match ctx.intent {
+            TaskIntent::Frozen => return Decision::Skip { reason: Reason::Frozen },
+            TaskIntent::Background => return Decision::Skip { reason: Reason::Background },
+            _ => {}
+        }
+        if ctx.thermal_pressure > 0.8 {
+            return Decision::Degrade { level: DegradeLevel::Relax, reason: Reason::ThermalPressure };
+        }
+        if ctx.audit_failure_rate > 0.5 {
+            return Decision::Degrade { level: DegradeLevel::Observe, reason: Reason::AuditFailureRate };
+        }
+        if self.pressure_sensitive && ctx.pressure == PressureLevel::Critical {
+            return Decision::Degrade { level: DegradeLevel::Relax, reason: Reason::MemoryPressure };
+        }
+        Decision::Allow { reason: Reason::ForegroundInteractive }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ctx(intent: TaskIntent) -> DecisionContext {
+        DecisionContext {
+            intent,
+            pressure: PressureLevel::Normal,
+            thermal_pressure: 0.0,
+            foreground: intent == TaskIntent::Interactive,
+            audit_failure_rate: 0.0,
+        }
+    }
 
     #[test]
     fn interactive_steers_until_pressure() {
@@ -244,5 +346,91 @@ mod tests {
         assert_eq!(ThreadHint::from_thread_name("GLThread"), ThreadHint::LatencySensitive);
         assert_eq!(ThreadHint::from_thread_name("ThreadPoolWorker"), ThreadHint::ComputeIntensive);
         assert_eq!(ThreadHint::from_thread_name("main"), ThreadHint::Unknown);
+    }
+
+    // ── P6.2-2: decide_ctx 测试矩阵 ──
+
+    #[test]
+    fn ctx_frozen_and_background_skip() {
+        let e = DecisionEngine::default();
+        assert_eq!(
+            e.decide_ctx(&ctx(TaskIntent::Frozen)),
+            Decision::Skip { reason: Reason::Frozen }
+        );
+        assert_eq!(
+            e.decide_ctx(&ctx(TaskIntent::Background)),
+            Decision::Skip { reason: Reason::Background }
+        );
+    }
+
+    #[test]
+    fn ctx_thermal_pressure_degrades() {
+        let e = DecisionEngine::default();
+        let mut c = ctx(TaskIntent::Interactive);
+        c.thermal_pressure = 0.9;
+        assert_eq!(
+            e.decide_ctx(&c),
+            Decision::Degrade { level: DegradeLevel::Relax, reason: Reason::ThermalPressure }
+        );
+    }
+
+    #[test]
+    fn ctx_audit_failure_rate_observes() {
+        let e = DecisionEngine::default();
+        let mut c = ctx(TaskIntent::BackgroundLatencySensitive);
+        c.audit_failure_rate = 0.8;
+        assert_eq!(
+            e.decide_ctx(&c),
+            Decision::Degrade { level: DegradeLevel::Observe, reason: Reason::AuditFailureRate }
+        );
+    }
+
+    #[test]
+    fn ctx_memory_pressure_critical_degrades() {
+        let e = DecisionEngine::default();
+        let mut c = ctx(TaskIntent::Interactive);
+        c.pressure = PressureLevel::Critical;
+        assert_eq!(
+            e.decide_ctx(&c),
+            Decision::Degrade { level: DegradeLevel::Relax, reason: Reason::MemoryPressure }
+        );
+    }
+
+    #[test]
+    fn ctx_normal_allows() {
+        let e = DecisionEngine::default();
+        assert_eq!(
+            e.decide_ctx(&ctx(TaskIntent::Interactive)),
+            Decision::Allow { reason: Reason::ForegroundInteractive }
+        );
+        assert_eq!(
+            e.decide_ctx(&ctx(TaskIntent::BackgroundLatencySensitive)),
+            Decision::Allow { reason: Reason::ForegroundInteractive }
+        );
+    }
+
+    #[test]
+    fn ctx_force_overrides() {
+        let e = DecisionEngine { force_affinity_enabled: true, ..Default::default() };
+        let mut c = ctx(TaskIntent::Frozen);
+        c.thermal_pressure = 0.99;
+        c.audit_failure_rate = 1.0;
+        assert_eq!(
+            e.decide_ctx(&c),
+            Decision::Allow { reason: Reason::ForceAffinity }
+        );
+    }
+
+    #[test]
+    fn ctx_bls_not_degrades_on_moderate() {
+        // BLS + Moderate 压力：不降级（只有 Critical 触发 MemoryPressure）
+        let e = DecisionEngine::default();
+        let mut c = ctx(TaskIntent::BackgroundLatencySensitive);
+        c.pressure = PressureLevel::Moderate;
+        assert_eq!(
+            e.decide_ctx(&c),
+            Decision::Allow { reason: Reason::ForegroundInteractive },
+            "Moderate 压力不应降级（保留干预，与 H1 语义一致）"
+        );
     }
 }

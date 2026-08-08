@@ -222,18 +222,30 @@ fn apply_single_tid(
 }
 
 /// 周期重锁定（relock）：对抗 Android AMS/cgroup 覆盖。
+/// relock 决策上下文（P6.2-2，daemon 组装传入——engine 不读 SystemContext/
+/// audit 之外的 proc，DecisionEngine 本身零 I/O）。
+pub struct RelockContext {
+    /// fast：内存压力等级（SystemContext 最近采样）
+    pub pressure: crate::system_context::PressureLevel,
+    /// fast：冷却设备使用率 0.0~1.0
+    pub thermal_pressure: f64,
+    /// slow：审计失败率 0.0~1.0（summary_windowed(60)）
+    pub audit_failure_rate: f64,
+}
+
 /// 遍历全部被跟踪进程做全线程刷新；getaffinity 短路保证空转开销小。
 ///
-/// Claude 审查 2.2：跳过后台/缓存进程（oom_adj > 500）——
-/// 后台应用不需要重新绑性能核，让 Linux scheduler 自然决定更省电；
-/// 且减少无效 setaffinity/cpuset 写入。前台/感知服务照常 relock。
+/// P6.2-2（ChatGPT 审查）：跳过逻辑从裸 oom_adj 阈值升级为 DecisionEngine 门控
+/// （Allow/Skip/Degrade + reason），Decision 输出不直接返回 Policy。
 pub fn relock_all(
     tracker: &mut StateTracker,
     cfg: &ConfigSnapshot,
     topo: &CpuTopology,
     now: i64,
+    rctx: &RelockContext,
+    decision: &crate::decision::DecisionEngine,
 ) -> usize {
-    use crate::decision::TaskIntent;
+    use crate::decision::{Decision, DecisionContext, TaskIntent};
     use crate::proc::read_oom_adj;
 
     let rt_allowed = can_rt_sched();
@@ -248,10 +260,20 @@ pub fn relock_all(
             tracker.remove(pid);
             continue;
         }
-        // 后台/缓存进程跳过 relock（省电 + 减少 syscall）
+        // 决策门控：intent（fast，per-pid）+ 系统压力（fast）+ 审计失败率（slow）
         let intent = TaskIntent::from_oom_adj(read_oom_adj(pid));
-        if matches!(intent, TaskIntent::Background | TaskIntent::Frozen) {
-            continue;
+        let dctx = DecisionContext {
+            intent,
+            pressure: rctx.pressure,
+            thermal_pressure: rctx.thermal_pressure,
+            foreground: intent == TaskIntent::Interactive,
+            audit_failure_rate: rctx.audit_failure_rate,
+        };
+        match decision.decide_ctx(&dctx) {
+            Decision::Allow { .. } => {}
+            // Skip/Degrade：跳过本轮重应用。Degrade 的 reason 已可解释
+            //（热/内存压力/审计失败），后续可进 audit（P6.2-2 记录点）。
+            Decision::Skip { .. } | Decision::Degrade { .. } => continue,
         }
         let (n, dirs) = refresh_process_rules(tracker, pid, &pkg, cfg, now, rt_allowed, topo);
         tracker.register_dirs(pid, &dirs);

@@ -45,6 +45,18 @@ pub struct AuditSummary {
     pub esrch: usize,               // 线程已退出
 }
 
+impl AuditSummary {
+    /// 失败率 0.0~1.0（P6.2-2：DecisionEngine 的 slow 信号）。
+    /// 失败 = total − success（downgraded 已计 success）。
+    pub fn failure_rate(&self) -> f64 {
+        if self.total_attempts == 0 {
+            0.0
+        } else {
+            (self.total_attempts - self.success) as f64 / self.total_attempts as f64
+        }
+    }
+}
+
 /// 全局审计缓冲（最近 N 条记录，环形）。
 static AUDIT_LOG: LazyLock<Mutex<Vec<AuditEntry>>> = LazyLock::new(|| Mutex::new(Vec::new()));
 const AUDIT_LOG_MAX: usize = 256;
