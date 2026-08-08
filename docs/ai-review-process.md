@@ -12,10 +12,19 @@ with DeepSeek's design docs and responses/adoptions in `docs/DeepSeek/`.
 
 | Role | Who | Contribution |
 |---|---|---|
-| Implementation | DeepSeek V4 Flash | All code, tests, debugging, documentation |
-| Architecture review | ChatGPT 5.5 | P5 must-haves (audit loop / multi-source intent / weight model), three-round matcher review, P6.2 direction (merge table, Backend abstraction, DecisionEngine boundary) |
-| Deep review | Claude Opus 4.x | General review + Android-specific review (Bionic sysinfo.procs thread count, Zygote window, MIUI freezing, TASK_COMM_LEN) |
-| Final adjudication | **Human (boss)** | Decides only on final effect; process decisions belong to the three AI colleagues |
+| **执行者（唯一写代码）** | DeepSeek V4 Flash | 全部代码、测试、调试、文档撰写。**唯一允许执行写操作/改代码的 AI** |
+| 架构基线 | DeepSeek V4 Pro | 仅提供架构方向/设计输入。**不得执行任何操作**（除非 boss 明确切换模型下令），不读代码、不改代码、不写文档 |
+| 文档审核（仅文档） | ChatGPT 5.5 | 只审文档（README / 设计 / 交付 doc 的一致性、可读性、准确性），不审代码、不改代码 |
+| 代码审核（代码·架构·工作流） | Claude Opus 4.x | 审代码质量、代码架构、开发工作流。**唯一负责任的代码审查者**（与 ChatGPT 的文档审查分离） |
+| 最终裁决 | **Human (boss)** | 只裁决最终效果；不理想才提异议。过程决策由三位 AI 同事共同定 |
+
+## 职责边界（防重叠）
+
+- **写代码 → 只有 DeepSeek V4 Flash**
+- 代码审查 → 只有 Claude（代码、架构、工作流）
+- 文档审查 → 只有 ChatGPT（文档一致性/可读性/准确）
+- 架构设计输入 → 只来自 DeepSeek V4 Pro（被动提供，不主动操作）
+- boss 不做实现决定，只验收最终效果
 
 ## Phase loop
 
