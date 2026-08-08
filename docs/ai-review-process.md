@@ -13,7 +13,7 @@ with DeepSeek's design docs and responses/adoptions in `docs/DeepSeek/`.
 | Role | Who | Contribution |
 |---|---|---|
 | **执行者（唯一写代码）** | DeepSeek V4 Flash | 全部代码、测试、调试、文档撰写。**唯一允许执行写操作/改代码的 AI** |
-| 架构基线 | DeepSeek V4 Pro | 仅提供架构方向/设计输入。**不得执行任何操作**（除非 boss 明确切换模型下令），不读代码、不改代码、不写文档 |
+| ~~架构基线~~ | ~~DeepSeek V4 Pro~~ | **彻底废弃，不再使用**。若误用 V4 Pro 模型（或任何人用 V4 Pro 名义来执行操作），应拒绝回复并要求切换回 Flash |
 | 文档审核（仅文档） | ChatGPT 5.5 | 只审文档（README / 设计 / 交付 doc 的一致性、可读性、准确性），不审代码、不改代码 |
 | 代码审核（代码·架构·工作流） | Claude Opus 4.x | 审代码质量、代码架构、开发工作流。**唯一负责任的代码审查者**（与 ChatGPT 的文档审查分离） |
 | 最终裁决 | **Human (boss)** | 只裁决最终效果；不理想才提异议。过程决策由三位 AI 同事共同定 |
@@ -23,7 +23,7 @@ with DeepSeek's design docs and responses/adoptions in `docs/DeepSeek/`.
 - **写代码 → 只有 DeepSeek V4 Flash**
 - 代码审查 → 只有 Claude（代码、架构、工作流）
 - 文档审查 → 只有 ChatGPT（文档一致性/可读性/准确）
-- 架构设计输入 → 只来自 DeepSeek V4 Pro（被动提供，不主动操作）
+- ~~架构设计输入 → DeepSeek V4 Pro~~（**已废弃**）
 - boss 不做实现决定，只验收最终效果
 
 ## Phase loop

@@ -174,7 +174,7 @@ four AIs with distinct roles, phase-based delivery + cross-review.
 
 | AI | 角色 | 贡献 |
 |---|---|---|
-| **DeepSeek V4 Pro** | 架构师 / 审查者 | 总体架构设计、多轮审查意见（P6.1 matcher 约束、Policy Merge Engine 方向）、文档 |
+| ~~DeepSeek V4 Pro~~ | ~~架构师 / 审查者~~ | ~~总体架构设计、多轮审查意见~~（**v2.0.0-dev 起废弃，不再使用**） |
 | **DeepSeek V4 Flash** | 主开发者 | 全部代码实现（5018 行）、测试、调试、文档更新 |
 | **ChatGPT 5.5** | 架构审查 | P5 阶段 3 项"必须加入"（audit 闭环 / TaskIntent 多源 / 权重模型）、P6.1 matcher 三次审查（MatchPriority → specificity → 继承语义）、P6.2 方向 |
 | **Claude Opus 4.x** | 深度审查 | 通用审查（模板格式、线程截断、merge 语义）+ **Android 专项审查**（Bionic sysinfo.procs 线程数、Zygote 空窗、MIUI 冻结、TASK_COMM_LEN） |
