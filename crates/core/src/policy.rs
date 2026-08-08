@@ -6,7 +6,8 @@ use std::io::Write as _;
 use std::sync::{LazyLock, Mutex};
 
 use crate::audit::{self, AuditEntry};
-use crate::topology::{create_cpuset_dir, CpuSet, CpuTopology, BASE_CPUSET};
+use crate::backend::{AffinityOps, CpusetOps, LinuxV1Backend, SchedulerOps};
+use crate::topology::{CpuSet, CpuTopology, BASE_CPUSET};
 
 /// 已确保存在的 cpuset 子目录缓存。
 static ENSURED_CPUSET_DIRS: LazyLock<Mutex<HashSet<String>>> =
@@ -47,16 +48,6 @@ pub fn short_circuit_total() -> u64 {
     SHORT_CIRCUIT_TOTAL.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-fn ensure_cpuset_dir(topo: &CpuTopology, dir_name: &str) {
-    if let Ok(mut guard) = ENSURED_CPUSET_DIRS.lock() {
-        if !guard.insert(dir_name.to_string()) {
-            return; // 已确保过
-        }
-    }
-    let path = format!("{BASE_CPUSET}/{dir_name}");
-    // EEXIST 由 create_cpuset_dir 内部静默处理。
-    create_cpuset_dir(&path, dir_name, &topo.mems_str);
-}
 
 /// 目录被 rmdir 回收后同步清除 ensure 缓存（Claude Q3：否则下次
 /// ensure 被缓存跳过 → cpuset tasks 写入失败）。tracker 回收目录时调用。
@@ -92,7 +83,7 @@ impl SchedPolicy {
         matches!(self, Self::Fifo | Self::Rr)
     }
 
-    fn to_libc(self) -> i32 {
+    pub(crate) fn to_libc(self) -> i32 {
         match self {
             // SCHED_OTHER 未在 libc crate 导出（glibc 中为 0）
             Self::Other => 0,
@@ -149,8 +140,9 @@ pub fn apply_thread(
     policy: &Policy,
     topo: &CpuTopology,
     rt_allowed: bool,
+    backend: &LinuxV1Backend,
 ) -> ApplyOutcome {
-    let mut outcome = apply_affinity(tid, pkg, policy, topo);
+    let mut outcome = apply_affinity(tid, pkg, policy, topo, backend);
 
     // BUG-M1 修复 (Claude)：线程已退出 → 早返，避免浪费 sched+uclamp syscall
     if outcome == ApplyOutcome::Exited {
@@ -163,23 +155,16 @@ pub fn apply_thread(
             return outcome;
         }
         // NEW-M1: sched 失败（ESRCH/EPERM/EINVAL）不再静默——合并进 outcome
-        if let Some(sched_outcome) = apply_sched(tid, pkg, pol, policy.sched_prio, policy.nice) {
+        if let Some(sched_outcome) = apply_sched(tid, pkg, pol, policy.sched_prio, policy.nice, backend) {
             outcome = sched_outcome;
         }
     }
 
     // NEW-H2: uclamp 应用（capability 检测到支持时才真正执行）
-    apply_uclamp(tid, pkg, policy.uclamp_min, policy.uclamp_max, &mut outcome);
+    apply_uclamp(tid, pkg, policy.uclamp_min, policy.uclamp_max, &mut outcome, backend);
 
     outcome
 }
-
-/// SCHED_FLAG_UTIL_CLAMP values (include/uapi/linux/sched.h, Linux 5.10+).
-/// BUG-H1 修复 (Claude)：此前用了错误的 0x4000_0000/0x01/0x02，导致
-/// sched_setattr 遇到未知 flag 位返回 EINVAL——uclamp 从未真正生效。
-const SCHED_FLAG_UTIL_CLAMP_MIN: u64 = 0x20;
-const SCHED_FLAG_UTIL_CLAMP_MAX: u64 = 0x40;
-const SCHED_FLAG_UTIL_CLAMP: u64 = 0x60;
 
 /// uclamp 能力缓存（ChatGPT V2：apply_uclamp 必须 capability 门控，
 /// 不支持的内核不反复 syscall 失败）。探测一次：/proc/sys/kernel/
@@ -206,7 +191,7 @@ fn uclamp_supported() -> bool {
     UCLAMP_SUPPORTED.load(Ordering::Relaxed)
 }
 
-/// uclamp 应用：sched_setattr(SCHED_FLAG_UTIL_CLAMP)。
+/// uclamp 应用：通过 backend（sched_setattr SCHED_FLAG_UTIL_CLAMP）。
 /// capability 门控（不支持的内核跳过）；失败不致命，warn_once + audit 记录。
 fn apply_uclamp(
     tid: i32,
@@ -214,6 +199,7 @@ fn apply_uclamp(
     min: Option<u32>,
     max: Option<u32>,
     outcome: &mut ApplyOutcome,
+    backend: &LinuxV1Backend,
 ) {
     if min.is_none() && max.is_none() {
         return;
@@ -222,59 +208,31 @@ fn apply_uclamp(
     if !uclamp_supported() {
         return;
     }
-    #[repr(C)]
-    struct SchedAttr {
-        size: u32,
-        sched_policy: u32,
-        sched_flags: u64,
-        sched_nice: i32,
-        sched_priority: u32,
-        sched_runtime: u64,
-        sched_deadline: u64,
-        sched_period: u64,
-        sched_util_min: u32,
-        sched_util_max: u32,
-    }
-    let mut attr: SchedAttr = unsafe { std::mem::zeroed() };
-    attr.size = std::mem::size_of::<SchedAttr>() as u32;
-    attr.sched_flags = SCHED_FLAG_UTIL_CLAMP
-        | if min.is_some() { SCHED_FLAG_UTIL_CLAMP_MIN } else { 0 }
-        | if max.is_some() { SCHED_FLAG_UTIL_CLAMP_MAX } else { 0 };
-    attr.sched_util_min = min.unwrap_or(0).clamp(0, 1024);
-    attr.sched_util_max = max.unwrap_or(1024).clamp(0, 1024);
-
-    let ret = unsafe {
-        libc::syscall(
-            libc::SYS_sched_setattr,
-            tid,
-            &mut attr as *mut SchedAttr,
-            0u32,
-        )
-    };
-    if ret != 0 {
-        let errno = std::io::Error::last_os_error().raw_os_error();
-        if errno == Some(libc::ESRCH) {
-            *outcome = ApplyOutcome::Exited;
-            return;
+    match backend.set_uclamp(tid, min, max) {
+        Ok(()) => {}
+        Err(errno) => {
+            if errno == libc::ESRCH {
+                *outcome = ApplyOutcome::Exited;
+                return;
+            }
+            // uclamp 失败不改变主 outcome（亲和性已生效），仅告警 + audit
+            if warn_once(&WARNED_EINVAL_TIDS, tid) {
+                eprintln!(
+                    "warning: uclamp set failed tid={tid} min={} max={} errno={errno} (kernel may lack uclamp)",
+                    min.unwrap_or(0),
+                    max.unwrap_or(1024)
+                );
+            }
+            audit::record(AuditEntry {
+                timestamp: 0,
+                tid,
+                pkg: pkg.to_string(),
+                requested_cpus: String::new(),
+                effective_cpus: String::new(),
+                success: false,
+                reason: "uclamp_failed".into(),
+            });
         }
-        // uclamp 失败不改变主 outcome（亲和性已生效），仅告警 + audit
-        if warn_once(&WARNED_EINVAL_TIDS, tid) {
-            eprintln!(
-                "warning: uclamp set failed tid={tid} min={} max={} errno={:?} (kernel may lack uclamp)",
-                min.unwrap_or(0),
-                max.unwrap_or(1024),
-                errno
-            );
-        }
-        audit::record(AuditEntry {
-            timestamp: 0,
-            tid,
-            pkg: pkg.to_string(),
-            requested_cpus: String::new(),
-            effective_cpus: String::new(),
-            success: false,
-            reason: "uclamp_failed".into(),
-        });
     }
 }
 
@@ -282,7 +240,7 @@ fn apply_uclamp(
 ///
 /// 顺序关键：先写 cpuset tasks 把线程移入我们的 cgroup（消除 Android foreground
 /// 等系统 cpuset 限制），再读 Cpus_allowed 交集，最后 setaffinity。
-fn apply_affinity(tid: i32, pkg: &str, policy: &Policy, topo: &CpuTopology) -> ApplyOutcome {
+fn apply_affinity(tid: i32, pkg: &str, policy: &Policy, topo: &CpuTopology, backend: &LinuxV1Backend) -> ApplyOutcome {
     let cpus = &policy.cpus;
     let cpuset_dir = &policy.cpuset_dir;
     let requested = cpus.to_range_string();
@@ -295,7 +253,7 @@ fn apply_affinity(tid: i32, pkg: &str, policy: &Policy, topo: &CpuTopology) -> A
     // ── ① 移入 cpuset（先放松 Android cgroup 限制）──
     if topo.cpuset_enabled && topo.base_cpuset_fd != -1 {
         if !cpuset_dir.is_empty() {
-            ensure_cpuset_dir(topo, cpuset_dir);
+            backend.ensure_dir(cpuset_dir);
         }
         let tasks = if cpuset_dir.is_empty() {
             format!("{BASE_CPUSET}/tasks")
@@ -326,7 +284,7 @@ fn apply_affinity(tid: i32, pkg: &str, policy: &Policy, topo: &CpuTopology) -> A
     }
 
     // ── ② 已符合目标则零开销返回 ──
-    if let Some(curr) = CpuSet::get_affinity(tid) {
+    if let Some(curr) = backend.get_affinity(tid) {
         if curr.bits == cpus.bits {
             SHORT_CIRCUIT_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             audit::record(AuditEntry {
@@ -353,7 +311,7 @@ fn apply_affinity(tid: i32, pkg: &str, policy: &Policy, topo: &CpuTopology) -> A
     }
 
     // ── ④ 内核 cgroup 允许集交集 ──
-    if let Some(allowed) = CpuSet::read_allowed_mask(tid) {
+    if let Some(allowed) = backend.read_allowed_mask(tid) {
         let before = effective.to_range_string();
         effective.and(&allowed);
         if effective.count() == 0 {
@@ -403,10 +361,9 @@ fn apply_affinity(tid: i32, pkg: &str, policy: &Policy, topo: &CpuTopology) -> A
 
     // ── ⑤ setaffinity ──
     let effective_str = effective.to_range_string();
-    match effective.set_affinity(tid) {
-        Err(e) => {
-            let errno = e.raw_os_error();
-            if errno == Some(libc::ESRCH) {
+    match backend.set_affinity(tid, &effective) {
+        Err(errno) => {
+            if errno == libc::ESRCH {
                 audit::record(AuditEntry {
                     timestamp: 0,
                     tid, pkg: pkg.to_string(),
@@ -417,7 +374,7 @@ fn apply_affinity(tid: i32, pkg: &str, policy: &Policy, topo: &CpuTopology) -> A
                 });
                 return ApplyOutcome::Exited;
             }
-            if errno == Some(libc::EINVAL) {
+            if errno == libc::EINVAL {
                 if warn_once(&WARNED_EINVAL_TIDS, tid) {
                     eprintln!("setaffinity(tid={tid}) unexpected EINVAL (mask={})", effective_str);
                 }
@@ -431,7 +388,7 @@ fn apply_affinity(tid: i32, pkg: &str, policy: &Policy, topo: &CpuTopology) -> A
                 });
                 return ApplyOutcome::EINVAL;
             }
-            if errno == Some(libc::EPERM) {
+            if errno == libc::EPERM {
                 // M2 修复：EPERM 去重（非 root 桌面场景避免刷屏）
                 if warn_once(&WARNED_EPERM_TIDS, tid) {
                     eprintln!("warning: setaffinity(tid={tid}) EPERM (no CAP_SYS_NICE or target restricted)");
@@ -446,7 +403,7 @@ fn apply_affinity(tid: i32, pkg: &str, policy: &Policy, topo: &CpuTopology) -> A
                 });
                 return ApplyOutcome::BlockedByPerm;
             }
-            eprintln!("setaffinity(tid={tid}) failed: {e}");
+            eprintln!("setaffinity(tid={tid}) failed: errno={errno}");
             audit::record(AuditEntry {
                 timestamp: 0,
                 tid, pkg: pkg.to_string(),
@@ -479,42 +436,34 @@ fn apply_sched(
     policy: SchedPolicy,
     rt_prio: Option<i32>,
     nice: Option<i32>,
+    backend: &LinuxV1Backend,
 ) -> Option<ApplyOutcome> {
-    let pol = policy.to_libc();
-    let ret = match policy {
-        SchedPolicy::Fifo | SchedPolicy::Rr => {
-            let mut p: libc::sched_param = unsafe { std::mem::zeroed() };
-            p.sched_priority = rt_prio.unwrap_or(1).clamp(1, 99);
-            unsafe { libc::sched_setscheduler(tid, pol, &p as *const libc::sched_param) }
-        }
-        _ => {
-            let p: libc::sched_param = unsafe { std::mem::zeroed() };
-            let r = unsafe { libc::sched_setscheduler(tid, pol, &p as *const libc::sched_param) };
-            if let Some(n) = nice {
-                let nr = unsafe { libc::setpriority(libc::PRIO_PROCESS, tid as u32, n.clamp(-20, 19)) };
-                if nr != 0 && r == 0 {
-                    // setpriority 失败但 sched 成功：记录但不覆盖主 outcome
-                    let errno = std::io::Error::last_os_error().raw_os_error();
-                    if warn_once(&WARNED_EPERM_TIDS, tid) {
-                        eprintln!("warning: setpriority(tid={tid}) failed errno={errno:?}");
-                    }
-                    audit::record(AuditEntry {
-                        timestamp: 0,
-                        tid,
-                        pkg: pkg.to_string(),
-                        requested_cpus: String::new(),
-                        effective_cpus: String::new(),
-                        success: false,
-                        reason: "nice_failed".into(),
-                    });
-                }
+    let ret = backend.set_scheduler(tid, policy, rt_prio);
+    if let Some(n) = nice {
+        if let Err(errno) = backend.set_nice(tid, n.clamp(-20, 19)) {
+            // setpriority 失败但 sched 成功：记录但不覆盖主 outcome
+            if warn_once(&WARNED_EPERM_TIDS, tid) {
+                eprintln!("warning: setpriority(tid={tid}) failed errno={errno:?}");
             }
-            r
+            audit::record(AuditEntry {
+                timestamp: 0,
+                tid,
+                pkg: pkg.to_string(),
+                requested_cpus: String::new(),
+                effective_cpus: String::new(),
+                success: false,
+                reason: "nice_failed".into(),
+            });
         }
+    }
+    let ret_result: Result<(), i32> = ret.map(|_| ());
+    let ret = match ret_result {
+        Ok(()) => 0,
+        Err(e) => e,
     };
 
     if ret != 0 {
-        let errno = std::io::Error::last_os_error().raw_os_error();
+        let errno = Some(ret);
         if errno == Some(libc::ESRCH) {
             return Some(ApplyOutcome::Exited);
         }

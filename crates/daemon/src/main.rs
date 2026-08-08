@@ -158,6 +158,7 @@ fn main() {
 
     // P6.2-2：最近一次 SystemContext 快照（relock 决策的 fast 信号输入）。
     let mut last_sys: Option<SystemContext> = None;
+    let backend = threadctl_core::backend::default_backend();
 
     // 组装 relock 决策上下文（fast: pressure/thermal + slow: audit failure rate）。
     let build_relock_ctx = |last_sys: &Option<SystemContext>| -> RelockContext {
@@ -185,7 +186,7 @@ fn main() {
             {
                 let mut t = lock_tracker(&tracker);
                 t.retain_interested(&pkg_set(&cfg));
-                let n = engine::relock_all(&mut t, &cfg, &topo, now, &build_relock_ctx(&last_sys), &decision_engine);
+                let n = engine::relock_all(&mut t, &cfg, &topo, now, &build_relock_ctx(&last_sys), &decision_engine, &backend);
                 println!("config change rescan done: applied {n} threads");
             }
         }
@@ -193,7 +194,7 @@ fn main() {
         // ── relock 周期锁定（对抗 Android 侧覆盖）──
         let lock_interval = cfg.engine.lock_interval;
         if lock_interval > 0 && now - last_lock >= lock_interval as i64 {
-            let n = engine::relock_all(&mut lock_tracker(&tracker), &cfg, &topo, now, &build_relock_ctx(&last_sys), &decision_engine);
+            let n = engine::relock_all(&mut lock_tracker(&tracker), &cfg, &topo, now, &build_relock_ctx(&last_sys), &decision_engine, &backend);
             last_lock = now;
             if n > 0 {
                 println!("relock: re-applied {n} threads");
@@ -215,7 +216,7 @@ fn main() {
         let deadline = Instant::now() + Duration::from_secs(poll_interval);
         let events = source.poll(deadline);
         if !events.is_empty() {
-            let n = engine::handle_events(&mut lock_tracker(&tracker), &events, &cfg, &topo, now);
+            let n = engine::handle_events(&mut lock_tracker(&tracker), &events, &cfg, &topo, now, &backend);
             if n > 0 {
                 println!("events: {} , applied {} threads", events.len(), n);
             }

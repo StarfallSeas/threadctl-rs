@@ -12,6 +12,7 @@ compile_error!("threadctl-core only supports Linux/Android targets");
 compile_error!("threadctl requires a 64-bit target");
 
 pub mod audit;
+pub mod backend;
 pub mod capability;
 pub mod caps;
 pub mod config;

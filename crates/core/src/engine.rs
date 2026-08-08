@@ -11,6 +11,7 @@
 use std::collections::HashSet;
 use std::sync::{LazyLock, Mutex};
 
+use crate::backend::LinuxV1Backend;
 use crate::caps::can_rt_sched;
 use crate::config::ConfigSnapshot;
 use crate::event::{EventKind, ProcessEvent};
@@ -29,11 +30,12 @@ pub fn handle_events(
     cfg: &ConfigSnapshot,
     topo: &CpuTopology,
     now: i64,
+    backend: &LinuxV1Backend,
 ) -> usize {
     let rt_allowed = can_rt_sched();
     let mut applied = 0;
     for ev in events {
-        applied += handle_event(tracker, ev, cfg, topo, now, rt_allowed);
+        applied += handle_event(tracker, ev, cfg, topo, now, rt_allowed, backend);
     }
     applied
 }
@@ -45,6 +47,7 @@ fn handle_event(
     topo: &CpuTopology,
     now: i64,
     rt_allowed: bool,
+    backend: &LinuxV1Backend,
 ) -> usize {
     match ev.kind {
         EventKind::Exit => {
@@ -77,14 +80,14 @@ fn handle_event(
                     // remove() 释放旧状态（含 dirs 引用），refresh 内部 enter 重建。
                     tracker.remove(ev.pid);
                     let (n, dirs) =
-                        refresh_process_rules(tracker, ev.pid, &pkg, cfg, now, rt_allowed, topo);
+                        refresh_process_rules(tracker, ev.pid, &pkg, cfg, now, rt_allowed, topo, backend);
                     tracker.register_dirs(ev.pid, &dirs);
                     mark_scanned(tracker, ev.pid, now);
                     n
                 }
                 EventKind::Fork => {
                     let (n, dirs) =
-                        refresh_process_rules(tracker, ev.pid, &pkg, cfg, now, rt_allowed, topo);
+                        refresh_process_rules(tracker, ev.pid, &pkg, cfg, now, rt_allowed, topo, backend);
                     tracker.register_dirs(ev.pid, &dirs);
                     mark_scanned(tracker, ev.pid, now);
                     n
@@ -96,13 +99,13 @@ fn handle_event(
                     });
                     if need_full {
                         let (n, dirs) = refresh_process_rules(
-                            tracker, ev.pid, &pkg, cfg, now, rt_allowed, topo,
+                            tracker, ev.pid, &pkg, cfg, now, rt_allowed, topo, backend,
                         );
                         tracker.register_dirs(ev.pid, &dirs);
                         mark_scanned(tracker, ev.pid, now);
                         n
                     } else {
-                        apply_single_tid(tracker, ev.pid, &pkg, ev.tid, cfg, topo, now, rt_allowed)
+                        apply_single_tid(tracker, ev.pid, &pkg, ev.tid, cfg, topo, now, rt_allowed, backend)
                     }
                 }
             }
@@ -128,6 +131,7 @@ fn refresh_process_rules(
     now: i64,
     rt_allowed: bool,
     topo: &CpuTopology,
+    backend: &LinuxV1Backend,
 ) -> (usize, Vec<String>) {
     let tids = list_tids(pid);
     let has_thread_rules = cfg.rules.has_thread_rules(pkg);
@@ -149,7 +153,7 @@ fn refresh_process_rules(
             String::new()
         };
         if let Some(policy) = cfg.rules.resolve(pkg, &tname) {
-            let outcome = policy::apply_thread(*tid, pkg, &policy, topo, rt_allowed);
+            let outcome = policy::apply_thread(*tid, pkg, &policy, topo, rt_allowed, backend);
             // Claude 审查 Bug 3：SkippedNoCpus（占位规则只应用 sched）不计数 applied
             match outcome {
                 ApplyOutcome::Exited => continue, // 线程已退出，下次全扫收敛
@@ -185,6 +189,7 @@ fn apply_single_tid(
     topo: &CpuTopology,
     now: i64,
     rt_allowed: bool,
+    backend: &LinuxV1Backend,
 ) -> usize {
     let policy = {
         let state = tracker.enter(pid, pkg.to_string(), now);
@@ -205,7 +210,7 @@ fn apply_single_tid(
         }
     };
 
-    let outcome = policy::apply_thread(tid, pkg, &policy, topo, rt_allowed);
+    let outcome = policy::apply_thread(tid, pkg, &policy, topo, rt_allowed, backend);
     // Claude 审查 Bug 3：SkippedNoCpus（sched 已应用）需更新 applied_tids 防重复
     // BUG-M2 修复：Exited 不记录（线程已死），SkippedNoCpus 记录（防重复 syscall）
     if outcome == ApplyOutcome::Exited {
@@ -278,6 +283,7 @@ pub fn relock_all(
     now: i64,
     rctx: &RelockContext,
     decision: &crate::decision::DecisionEngine,
+    backend: &LinuxV1Backend,
 ) -> usize {
     use crate::decision::{Decision, DecisionContext, TaskIntent};
     use crate::proc::read_oom_adj;
@@ -317,7 +323,7 @@ pub fn relock_all(
                 continue;
             }
         }
-        let (n, dirs) = refresh_process_rules(tracker, pid, &pkg, cfg, now, rt_allowed, topo);
+        let (n, dirs) = refresh_process_rules(tracker, pid, &pkg, cfg, now, rt_allowed, topo, backend);
         tracker.register_dirs(pid, &dirs);
         applied += n;
     }
