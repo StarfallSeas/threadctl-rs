@@ -413,8 +413,8 @@ fn merge_by_priority(matches: &[RuleMatch], rules: &[CompiledRule]) -> Option<Po
     let mut sched = None;
     let mut sched_prio = None;
     let mut nice = None;
-    let mut uclamp_min = None;
-    let mut uclamp_max = None;
+    let mut uclamp_min: Option<u32> = None;
+    let mut uclamp_max: Option<u32> = None;
 
     // 按 source 分组：组内 cpus OR，跨组覆盖
     let mut group_cpus = CpuSet::new();
@@ -444,12 +444,14 @@ fn merge_by_priority(matches: &[RuleMatch], rules: &[CompiledRule]) -> Option<Po
         if nice.is_none() {
             nice = r.policy.nice;
         }
-        // NEW-H2: uclamp 高优先级来源有值者生效（与 sched 一致）
-        if uclamp_min.is_none() {
-            uclamp_min = r.policy.uclamp_min;
+        // ChatGPT V3: uclamp 是**约束合并**而非 FirstWins——
+        // uclamp_min 取跨来源最大值（保底累积：所有来源的保底都满足），
+        // uclamp_max 取跨来源最小值（上限累积：所有来源的上限都满足）。
+        if let Some(m) = r.policy.uclamp_min {
+            uclamp_min = Some(uclamp_min.map_or(m, |cur| cur.max(m)));
         }
-        if uclamp_max.is_none() {
-            uclamp_max = r.policy.uclamp_max;
+        if let Some(m) = r.policy.uclamp_max {
+            uclamp_max = Some(uclamp_max.map_or(m, |cur| cur.min(m)));
         }
     }
     if group_has_cpus && !cpus_set {
@@ -714,6 +716,39 @@ mod tests {
         let p = rs.resolve("com.x", "").expect("resolve");
         assert_eq!(p.uclamp_min, Some(700), "uclamp_min must not be dropped");
         assert_eq!(p.uclamp_max, Some(1024), "uclamp_max must not be dropped");
+    }
+
+    #[test]
+    fn uclamp_constraint_merge() {
+        // ChatGPT V3: uclamp is constraint merge, not FirstWins.
+        // min takes the max across sources (all floor guarantees satisfied),
+        // max takes the min across sources (all ceiling limits satisfied).
+        let rules = vec![
+            RuleConfig {
+                pkg: "com.x".into(),
+                thread: String::new(),
+                cpus: "0-1".into(),
+                sched: None,
+                nice: None,
+                uclamp_min: Some(300),
+                uclamp_max: Some(512),
+            },
+            RuleConfig {
+                pkg: "com.x".into(),
+                thread: String::new(),
+                cpus: "2-3".into(),
+                sched: None,
+                nice: None,
+                uclamp_min: Some(700),
+                uclamp_max: Some(1024),
+            },
+        ];
+        let rs = RuleSet::compile(&rules, &topo()).rules;
+        let p = rs.resolve("com.x", "").expect("resolve");
+        assert_eq!(p.uclamp_min, Some(700), "min must take the max (700 > 300)");
+        assert_eq!(p.uclamp_max, Some(512), "max must take the min (512 < 1024)");
+        // cpus 仍按 BitOr 合并
+        assert_eq!(p.cpus.to_range_string(), "0-3");
     }
 
     #[test]
