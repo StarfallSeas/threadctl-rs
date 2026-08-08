@@ -174,8 +174,33 @@ const SCHED_FLAG_UTIL_CLAMP: u64 = 0x4000_0000;
 const SCHED_FLAG_UTIL_CLAMP_MIN: u64 = 0x0000_0001;
 const SCHED_FLAG_UTIL_CLAMP_MAX: u64 = 0x0000_0002;
 
+/// uclamp 能力缓存（ChatGPT V2：apply_uclamp 必须 capability 门控，
+/// 不支持的内核不反复 syscall 失败）。探测一次：/proc/sys/kernel/
+/// sched_util_clamp_max 存在且 > 0（与 capability.rs 同源）。
+static UCLAMP_SUPPORTED: LazyLock<std::sync::atomic::AtomicBool> =
+    LazyLock::new(|| std::sync::atomic::AtomicBool::new(false));
+static UCLAMP_CHECKED: LazyLock<std::sync::atomic::AtomicBool> =
+    LazyLock::new(|| std::sync::atomic::AtomicBool::new(false));
+
+fn uclamp_supported() -> bool {
+    use std::sync::atomic::Ordering;
+    if !UCLAMP_CHECKED.load(Ordering::Relaxed) {
+        let supported = fs::read_to_string("/proc/sys/kernel/sched_util_clamp_max")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .map(|max| max > 0)
+            .unwrap_or(false);
+        UCLAMP_SUPPORTED.store(supported, Ordering::Relaxed);
+        UCLAMP_CHECKED.store(true, Ordering::Relaxed);
+        if !supported {
+            eprintln!("warning: uclamp unsupported (kernel lacks CONFIG_UCLAMP_TASK); uclamp fields will be ignored");
+        }
+    }
+    UCLAMP_SUPPORTED.load(Ordering::Relaxed)
+}
+
 /// uclamp 应用：sched_setattr(SCHED_FLAG_UTIL_CLAMP)。
-/// 失败不致命（内核不支持/权限不足），warn_once + audit 记录。
+/// capability 门控（不支持的内核跳过）；失败不致命，warn_once + audit 记录。
 fn apply_uclamp(
     tid: i32,
     pkg: &str,
@@ -184,6 +209,10 @@ fn apply_uclamp(
     outcome: &mut ApplyOutcome,
 ) {
     if min.is_none() && max.is_none() {
+        return;
+    }
+    // ChatGPT V2: capability 门控——内核不支持时直接跳过，不反复 syscall
+    if !uclamp_supported() {
         return;
     }
     #[repr(C)]

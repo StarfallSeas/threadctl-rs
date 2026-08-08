@@ -152,15 +152,21 @@ policy::apply_thread（三层过滤 + cpuset 移入 + audit 记录）
 - P6.0：Profile 抽象（7 模板）
 - P6.1：matcher（RuleMatch / specificity / 继承语义 / 实例缓存）—— **冻结，不再改**
 
-### P6.2 设计输入（已知方向，待 GPT 设计细化）
-1. **决策引擎接入 relock**：`DecisionEngine::decide(TaskIntent, PressureLevel) -> ActionLevel` 替换当前裸 oom_adj 阈值；audit `summary_windowed(60)` 作为 Adjust 输入
-2. **来源优先级矩阵**：`RuleSource` 的 Global/Profile/Group 变体已预留，Config Compiler 展开时标注来源
-3. **Zygote fork 空窗**：新进程 cmdline 延迟填充 → pending 队列 200ms 重读
-4. **`@@main` 主线程语法**：tid==pid 匹配（替代手动截断包名）
+### P6.2 设计输入（ChatGPT 5.5 V2 已定界）
+1. **Policy Merge Engine**：从 `ruleset.rs` 拆出 `merge.rs`——数据驱动 merge table：
+   `MergeStrategy{Override, FillMissing, BitOr, FirstWins}` 按字段映射
+   （Cpus→BitOr / Sched→Override / Nice→FirstWins），未来 profile/group 来源接入不重构
+2. **DecisionEngine 接入 relock**：替换裸 oom_adj 阈值 → TaskIntent + SystemContext
+   + Foreground + Audit；输出 **allow/skip/degrade**（不做 kill/freeze/migrate）
+3. **Backend 抽象**：AffinityBackend / CpusetBackend / SchedBackend（Android cgroup v1→v2 迁移准备）
+4. **Zygote fork 空窗**：PendingProcess{pid, first_seen, retry_count, deadline}
+   + 指数退避（100ms/300ms/1s），非固定 200ms
 5. **tracing 日志**：eprintln → tracing 宏 + Android logcat
+
+**明确不做（ChatGPT V2 禁止项）**：userspace freezer、自动 CPU 迁移、
+后台杀进程、scheduler replacement。`inherit false` 暂缓（观察真实配置需求）。
 
 ### 已记录的技术债
 - `decision.rs` / `foreground.rs` 未真正接入主循环（仅启动打印 / debug）
-- `Policy` 无 uclamp 字段（capability 已检测但未落地到执行）
 - 多进程 App（`:service`）子进程需单独配置
 - MIUI 冻结进程（SIGSTOP）relock 浪费 → is_frozen 检查
