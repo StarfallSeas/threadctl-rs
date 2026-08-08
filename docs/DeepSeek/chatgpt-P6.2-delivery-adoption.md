@@ -42,32 +42,13 @@
 
 ---
 
-## 3. Q8 文档结构 — 待人类裁决
+## 3. Q8 文档结构 — 人类裁决：保持现状
 
-ChatGPT 建议：
+ChatGPT 建议主架构文档不绑 AI 名（`docs/architecture/` + `docs/reviews/` + `docs/history/`）。
 
-```
-docs/
-├── architecture/    # matcher.md / merge.md（不绑定 AI 名）
-├── reviews/         # 2026-08-p61/ 等按阶段归档
-└── history/         # DeepSeek/ ChatGPT/ Claude/（审查历史）
-```
-
-用户（人类裁决）此前要求：
-
-```
-docs/DeepSeek/  docs/ChatGPT/  docs/Claude/  （按产出方）
-```
-
-**冲突点**：ChatGPT 主张主架构文档不应绑 AI 名（未来贡献者不该理解"AI 目录"）；
-用户要求按产出方分三目录（当前已落地）。
-
-**折中提案**（待用户选择）：
-- A：保持现状（三目录），README 中定位为"审查与设计历史归档"
-- B：采纳 ChatGPT——`docs/architecture/` 放主架构（matcher.md/merge.md/architecture.md），
-  `docs/reviews/` 按阶段归档，`docs/history/` 保留三 AI 目录存审查原文
-- C：混合——`docs/DeepSeek/` 等保留为审查历史，主架构文档
-  （architecture.md）移到 `docs/architecture/`
+**人类（boss）裁决**：不动，保持 `docs/DeepSeek/` / `docs/ChatGPT/` / `docs/Claude/`
+三目录（项目做法由三位 AI 同事共同决定，文档结构属过程细节，boss 只看最终效果）。
+→ **采纳方案 A**：三目录保持，README 定位为"审查与设计归档"。
 
 ---
 
