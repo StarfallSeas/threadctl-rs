@@ -3,7 +3,9 @@
 threadctl-rs is developed through a human-adjudicated multi-AI workflow:
 an implementation AI produces code, then architecture/review AIs cross-review
 it before it freezes. This document records the process; the raw review logs
-live in `docs/reviews/`.
+live in `docs/reviews/` (raw AI review records: `claude/` / `chatgpt5.5/`),
+with DeepSeek's responses/adoptions in `docs/responses/` and phase design docs
+in `docs/design/`.
 
 ## Roles
 

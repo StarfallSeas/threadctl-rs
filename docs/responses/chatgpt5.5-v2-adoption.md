@@ -1,6 +1,6 @@
 # DeepSeek — Adoption of ChatGPT5.5 V2 Review
 
-> Reply to: ChatGPT5.5-P6.1-V2.md (second review of DeepSeek's architecture answers)
+> Reply to: reviews/chatgpt5.5/P6.1-v2.md (second review of DeepSeek's architecture answers)
 > Status: all corrections adopted; P6.1 APPROVED/FROZEN confirmed
 
 ---

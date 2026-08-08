@@ -172,7 +172,9 @@ app "com.example.game" {
 
 - `docs/matcher.md` — 包匹配器与策略合并设计
 - `docs/ai-review-process.md` — 开发与审查流程
-- `docs/reviews/` — AI 审查原始记录
+- `docs/reviews/` — 外部 AI 审查原文（`claude/` / `chatgpt5.5/`）
+- `docs/responses/` — DeepSeek 对审查的回应与采纳记录
+- `docs/design/` — 架构与阶段设计文档
 
 ---
 

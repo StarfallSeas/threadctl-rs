@@ -174,7 +174,9 @@ app "com.example.game" {
 
 - `docs/matcher.md` — package matcher & policy merge design
 - `docs/ai-review-process.md` — development & review process
-- `docs/reviews/` — raw AI review records
+- `docs/reviews/` — raw AI review records (`claude/` / `chatgpt5.5/`)
+- `docs/responses/` — DeepSeek responses & adoptions
+- `docs/design/` — architecture & phase design docs
 
 ---
 
