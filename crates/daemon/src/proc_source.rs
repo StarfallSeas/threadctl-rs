@@ -95,7 +95,7 @@ impl ProcSource {
             // 增量路径：只检查已跟踪进程的线程增量。
             let pids = self.tracker.lock().unwrap_or_else(|e| e.into_inner()).pids();
             for pid in pids {
-                if unsafe { libc::kill(pid, 0) } != 0 {
+                if !threadctl_core::proc::is_alive(pid) {
                     continue; // 死进程，下方 Exit 检测处理
                 }
                 current_pids.insert(pid);

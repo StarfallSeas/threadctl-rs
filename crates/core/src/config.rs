@@ -545,7 +545,9 @@ fn policy_to_rules(pkg: &str, thread: &str, pol: &PolicyModel, clusters: &[crate
         pol.cpus.clone()
     };
 
-    if cpus.is_none() && pol.sched.is_none() && pol.nice.unwrap_or(0) == 0 {
+    if cpus.is_none() && pol.sched.is_none() && pol.nice.is_none() {
+        // NEW-L2 (Claude): nice.is_none() 而非 unwrap_or(0)==0——
+        // 显式 nice = 0（重置为默认）是合法配置，不能被静默丢弃。
         return vec![];
     }
 

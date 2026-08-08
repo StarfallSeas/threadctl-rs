@@ -149,8 +149,11 @@ impl InotifyWatch {
         Some(reload_needed)
     }
 
-    /// 重装 watch；失败返回 false（调用方降级轮询）。
+    /// Reinstall the watch; false → caller falls back to polling.
     fn reinstall(&mut self) -> bool {
+        // NOTE: libc crate signature is inotify_rm_watch(fd: i32, wd: u32) —
+        // the `as u32` cast is correct (Claude NEW-L1 flagged it, verified against
+        // the actual libc version in use: it takes u32).
         unsafe { libc::inotify_rm_watch(self.fd, self.wd as u32) };
         let cstr = match CString::new(self.config_file.as_str()) {
             Ok(c) => c,

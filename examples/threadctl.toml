@@ -21,7 +21,7 @@ scan_interval = 2
 # Android 设备必须启用：AMS/ActivityManager 会在 App 切换时重置 CPU 亲和性，
 # lock_interval 控制守护进程多久重新应用一次规则（即使没有收到新事件）。
 # 桌面 Linux 可设为 0 禁用周期重锁定（仅事件驱动）。
-lock_interval = 5
+lock_interval = 60
 
 # 秒；已退出进程的 cpuset 引用清理间隔
 dead_cleanup_interval = 15

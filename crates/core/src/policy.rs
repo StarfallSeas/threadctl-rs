@@ -58,6 +58,14 @@ fn ensure_cpuset_dir(topo: &CpuTopology, dir_name: &str) {
     create_cpuset_dir(&path, dir_name, &topo.mems_str);
 }
 
+/// 目录被 rmdir 回收后同步清除 ensure 缓存（Claude Q3：否则下次
+/// ensure 被缓存跳过 → cpuset tasks 写入失败）。tracker 回收目录时调用。
+pub(crate) fn forget_cpuset_dir(dir_name: &str) {
+    if let Ok(mut guard) = ENSURED_CPUSET_DIRS.lock() {
+        guard.remove(dir_name);
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SchedPolicy {
     Other,
@@ -105,6 +113,9 @@ pub struct Policy {
     pub sched: Option<SchedPolicy>,
     pub sched_prio: Option<i32>,
     pub nice: Option<i32>,
+    /// uclamp（Claude review NEW-H2：此前配置解析后静默丢失，全链路补齐）。
+    pub uclamp_min: Option<u32>,
+    pub uclamp_max: Option<u32>,
 }
 
 /// 对单个线程应用亲和性 + cpuset + 调度策略的结果（Measure 环节输入）。
@@ -139,17 +150,96 @@ pub fn apply_thread(
     topo: &CpuTopology,
     rt_allowed: bool,
 ) -> ApplyOutcome {
-    let outcome = apply_affinity(tid, pkg, policy, topo);
+    let mut outcome = apply_affinity(tid, pkg, policy, topo);
 
     if let Some(pol) = policy.sched {
         if pol.is_rt() && !rt_allowed {
             eprintln!("warning: tid={tid} needs RT scheduling but lacks CAP_SYS_NICE; sched skipped");
             return outcome;
         }
-        apply_sched(tid, pol, policy.sched_prio, policy.nice);
+        // NEW-M1: sched 失败（ESRCH/EPERM/EINVAL）不再静默——合并进 outcome
+        if let Some(sched_outcome) = apply_sched(tid, pkg, pol, policy.sched_prio, policy.nice) {
+            outcome = sched_outcome;
+        }
     }
 
+    // NEW-H2: uclamp 应用（capability 检测到支持时才真正执行）
+    apply_uclamp(tid, pkg, policy.uclamp_min, policy.uclamp_max, &mut outcome);
+
     outcome
+}
+
+/// SCHED_FLAG_UTIL_CLAMP (include/uapi/linux/sched.h)
+const SCHED_FLAG_UTIL_CLAMP: u64 = 0x4000_0000;
+const SCHED_FLAG_UTIL_CLAMP_MIN: u64 = 0x0000_0001;
+const SCHED_FLAG_UTIL_CLAMP_MAX: u64 = 0x0000_0002;
+
+/// uclamp 应用：sched_setattr(SCHED_FLAG_UTIL_CLAMP)。
+/// 失败不致命（内核不支持/权限不足），warn_once + audit 记录。
+fn apply_uclamp(
+    tid: i32,
+    pkg: &str,
+    min: Option<u32>,
+    max: Option<u32>,
+    outcome: &mut ApplyOutcome,
+) {
+    if min.is_none() && max.is_none() {
+        return;
+    }
+    #[repr(C)]
+    struct SchedAttr {
+        size: u32,
+        sched_policy: u32,
+        sched_flags: u64,
+        sched_nice: i32,
+        sched_priority: u32,
+        sched_runtime: u64,
+        sched_deadline: u64,
+        sched_period: u64,
+        sched_util_min: u32,
+        sched_util_max: u32,
+    }
+    let mut attr: SchedAttr = unsafe { std::mem::zeroed() };
+    attr.size = std::mem::size_of::<SchedAttr>() as u32;
+    attr.sched_flags = SCHED_FLAG_UTIL_CLAMP
+        | if min.is_some() { SCHED_FLAG_UTIL_CLAMP_MIN } else { 0 }
+        | if max.is_some() { SCHED_FLAG_UTIL_CLAMP_MAX } else { 0 };
+    attr.sched_util_min = min.unwrap_or(0).clamp(0, 1024);
+    attr.sched_util_max = max.unwrap_or(1024).clamp(0, 1024);
+
+    let ret = unsafe {
+        libc::syscall(
+            libc::SYS_sched_setattr,
+            tid,
+            &mut attr as *mut SchedAttr,
+            0u32,
+        )
+    };
+    if ret != 0 {
+        let errno = std::io::Error::last_os_error().raw_os_error();
+        if errno == Some(libc::ESRCH) {
+            *outcome = ApplyOutcome::Exited;
+            return;
+        }
+        // uclamp 失败不改变主 outcome（亲和性已生效），仅告警 + audit
+        if warn_once(&WARNED_EINVAL_TIDS, tid) {
+            eprintln!(
+                "warning: uclamp set failed tid={tid} min={} max={} errno={:?} (kernel may lack uclamp)",
+                min.unwrap_or(0),
+                max.unwrap_or(1024),
+                errno
+            );
+        }
+        audit::record(AuditEntry {
+            timestamp: 0,
+            tid,
+            pkg: pkg.to_string(),
+            requested_cpus: String::new(),
+            effective_cpus: String::new(),
+            success: false,
+            reason: "uclamp_failed".into(),
+        });
+    }
 }
 
 /// 亲和性：cpuset 移入 → getaffinity → online∩allowed 交集 → setaffinity。
@@ -256,6 +346,9 @@ fn apply_affinity(tid: i32, pkg: &str, policy: &Policy, topo: &CpuTopology) -> A
                     allowed.to_range_string()
                 );
             }
+            // NEW-M2: 交集缩减后必须补 setaffinity——否则线程 affinity 仍是宽掩码，
+            // 下轮 getaffinity 短路永远无法命中，且状态与 audit 记录不符。
+            let _ = effective.set_affinity(tid);
             audit::record(AuditEntry {
                 timestamp: 0,
                 tid, pkg: pkg.to_string(),
@@ -342,26 +435,68 @@ fn apply_affinity(tid: i32, pkg: &str, policy: &Policy, topo: &CpuTopology) -> A
     }
 }
 
-fn apply_sched(tid: i32, policy: SchedPolicy, rt_prio: Option<i32>, nice: Option<i32>) {
+/// 应用调度策略。返回 `Some(outcome)` 表示失败（ESRCH/EPERM/EINVAL），
+/// `None` 表示成功或无需处理（NEW-M1：syscall 返回值不再丢弃）。
+fn apply_sched(
+    tid: i32,
+    pkg: &str,
+    policy: SchedPolicy,
+    rt_prio: Option<i32>,
+    nice: Option<i32>,
+) -> Option<ApplyOutcome> {
     let pol = policy.to_libc();
-    match policy {
+    let ret = match policy {
         SchedPolicy::Fifo | SchedPolicy::Rr => {
             let mut p: libc::sched_param = unsafe { std::mem::zeroed() };
             p.sched_priority = rt_prio.unwrap_or(1).clamp(1, 99);
-            unsafe {
-                libc::sched_setscheduler(tid, pol, &p as *const libc::sched_param);
-            }
+            unsafe { libc::sched_setscheduler(tid, pol, &p as *const libc::sched_param) }
         }
         _ => {
             let p: libc::sched_param = unsafe { std::mem::zeroed() };
-            unsafe {
-                libc::sched_setscheduler(tid, pol, &p as *const libc::sched_param);
-            }
+            let r = unsafe { libc::sched_setscheduler(tid, pol, &p as *const libc::sched_param) };
             if let Some(n) = nice {
-                unsafe {
-                    libc::setpriority(libc::PRIO_PROCESS, tid as u32, n.clamp(-20, 19));
+                let nr = unsafe { libc::setpriority(libc::PRIO_PROCESS, tid as u32, n.clamp(-20, 19)) };
+                if nr != 0 && r == 0 {
+                    // setpriority 失败但 sched 成功：记录但不覆盖主 outcome
+                    let errno = std::io::Error::last_os_error().raw_os_error();
+                    if warn_once(&WARNED_EPERM_TIDS, tid) {
+                        eprintln!("warning: setpriority(tid={tid}) failed errno={errno:?}");
+                    }
+                    audit::record(AuditEntry {
+                        timestamp: 0,
+                        tid,
+                        pkg: pkg.to_string(),
+                        requested_cpus: String::new(),
+                        effective_cpus: String::new(),
+                        success: false,
+                        reason: "nice_failed".into(),
+                    });
                 }
             }
+            r
         }
+    };
+
+    if ret != 0 {
+        let errno = std::io::Error::last_os_error().raw_os_error();
+        if errno == Some(libc::ESRCH) {
+            return Some(ApplyOutcome::Exited);
+        }
+        if warn_once(&WARNED_EPERM_TIDS, tid) {
+            eprintln!(
+                "warning: sched_setscheduler(tid={tid}) failed errno={errno:?} (RT needs root/CAP_SYS_NICE)"
+            );
+        }
+        audit::record(AuditEntry {
+            timestamp: 0,
+            tid,
+            pkg: pkg.to_string(),
+            requested_cpus: String::new(),
+            effective_cpus: String::new(),
+            success: false,
+            reason: "sched_failed".into(),
+        });
+        return Some(ApplyOutcome::BlockedByPerm);
     }
+    None
 }

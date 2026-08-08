@@ -158,6 +158,9 @@ impl StateTracker {
                     if !remove_cpuset_dir(&path) {
                         eprintln!("cpuset dir reclaim failed: {path}");
                     } else {
+                        // Claude Q3: rmdir 后同步清除 ensure 缓存，否则下次
+                        // ensure 被缓存跳过 → cpuset tasks 写入失败
+                        crate::policy::forget_cpuset_dir(dir);
                         println!("cpuset dir reclaimed: {path}");
                     }
                 }

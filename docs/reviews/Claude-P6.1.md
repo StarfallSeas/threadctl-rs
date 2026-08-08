@@ -1,0 +1,341 @@
+现在我已经完整读完所有代码和文档。让我做最终整合分析。
+
+好，全部代码与文档已读完（~5100行 Rust + 文档）。以下是我独立审查后的报告，重点标注 **DSV4 Flash 之前没有发现的新问题**。
+
+---
+
+# threadctl-rs — Claude 深度审查报告
+
+> 审查范围：全部源文件逐行 + 5份前轮审查文档  
+> 参照基线：DeepSeek-V4-Flash-Audit.md（19项已修复）+ DeepSeek-V4-Flash-Final.md  
+> 本轮新发现：14项
+
+---
+
+## 一、新发现：高严重度
+
+### 🔴 NEW-H1 `decision.rs` — `evaluate()` 与 `decide()` 行为不一致
+
+**这是架构级 bug，P6.2 接入时会导致静默行为回归。**
+
+```rust
+// decide() 对 BackgroundLatencySensitive + Normal → Steer
+(TaskIntent::BackgroundLatencySensitive, _) => ActionLevel::Steer,
+
+// evaluate() + to_action() 对同样输入 → Observe
+// intent_weight=30, pressure_mod=0, thermal_mod=0 → total=30
+// to_action 阈值 n >= 40 → Observe
+```
+
+两条 API 声称功能等价，实际给出相反结论。`BackgroundLatencySensitive` 在 Normal 压力下：
+
+| 接口 | 结果 |
+|---|---|
+| `decide(BLS, Normal)` | `Steer` |
+| `evaluate(BLS, Normal, 0.0).to_action(false)` | `Observe` |
+
+测试 `task_score_sums` 没有覆盖 `to_action()`，所以这个不一致对测试是透明的。
+
+**修复**：将 `to_action` 的阈值从 40 改为 30，或将 `BackgroundLatencySensitive` 的 `intent_weight` 改为 50，使两路保持一致。更根本的方案是用 `evaluate` 替代 `decide`，只保留一条决策路径。
+
+---
+
+### 🔴 NEW-H2 `policy.rs` — `uclamp_min`/`uclamp_max` 全链路静默丢失
+
+配置解析链：`RuleConfig.uclamp_min` → `PolicyModel.uclamp_min` → `RuleConfig.uclamp_min` 在 `RuleSet::compile` 时...
+
+```rust
+// ruleset.rs compile()
+rules.push(CompiledRule {
+    policy: Policy {
+        cpus,
+        cpuset_dir: dir_name,
+        sched,
+        sched_prio,
+        nice: rc.nice,
+        // ← uclamp_min / uclamp_max 消失了！
+    },
+});
+```
+
+`Policy` 结构体根本没有 uclamp 字段。用户配置 `uclamp-min = 700` → 解析 ✅ → 编译到 `CompiledRule` → **丢失** → `apply_thread` → 没有任何 uclamp syscall。
+
+`capability.rs` 已能检测 uclamp 支持，`CapabilitySet.preferred_order` 也把 uclamp 放首位，但整条功能链从未闭合。这不是"TODO"，而是**配置静默无效**，用户设置了值以为生效了，实际没有。
+
+**修复**：`Policy` 增加 `uclamp_min: Option<u32>, uclamp_max: Option<u32>`；`apply_sched` 中对 non-RT policy 调用 `sched_setattr` + `SCHED_FLAG_UTIL_CLAMP_MIN|MAX`；或者在 `capability.check_uclamp() == false` 时跳过并记录 audit。
+
+---
+
+## 二、新发现：中严重度
+
+### 🟠 NEW-M1 `policy.rs::apply_sched` — syscall 返回值全部丢弃
+
+```rust
+fn apply_sched(tid: i32, policy: SchedPolicy, rt_prio: Option<i32>, nice: Option<i32>) {
+    ...
+    unsafe {
+        libc::sched_setscheduler(tid, pol, &p as *const libc::sched_param);
+        // ← 返回值丢弃！
+    }
+    if let Some(n) = nice {
+        unsafe {
+            libc::setpriority(libc::PRIO_PROCESS, tid as u32, n.clamp(-20, 19));
+            // ← 返回值丢弃！
+        }
+    }
+}
+```
+
+后果：`sched_setscheduler` 失败（ESRCH、EPERM、EINVAL）时，调用方收到的仍是 `apply_affinity` 的结果（可能是 `Applied`），audit 记录 `success: true`，但调度策略**未生效**。这与 `setaffinity` 有完整错误处理形成鲜明对比。
+
+**修复**：`apply_sched` 改为返回 `Option<ApplyOutcome>`，对 ESRCH 返回 `Some(Exited)`，EPERM 走 warn_once 并写 audit，最终 `apply_thread` 合并两个结果。
+
+---
+
+### 🟠 NEW-M2 `policy.rs::apply_affinity` — `Downgraded` 路径跳过 setaffinity
+
+```rust
+// Step ④：allowed 交集
+let after = effective.to_range_string();
+if before != after {
+    // 交集非空但变小 → 返回 Downgraded
+    audit::record(AuditEntry { success: true, reason: "downgraded" });
+    return ApplyOutcome::Downgraded;  // ← 提前返回，Step ⑤ (setaffinity) 被跳过
+}
+```
+
+设计注释说的是"cpuset 移入 → allowed 交集 → setaffinity"三步顺序，但 `Downgraded` 只做了前两步。结果：线程被移入我们的 cpuset 目录，但 `sched_getaffinity` 读到的 affinity 可能仍是系统宽掩码（不是缩减后的交集）。cpuset 在 cgroup 层面提供限制，但 `sched_getaffinity` 的结果与预期不符，下轮 getaffinity 短路检查也无法命中。
+
+**修复**：`Downgraded` 返回前补调 `effective.set_affinity(tid)`（缩减后的交集），再写 audit。
+
+---
+
+### 🟠 NEW-M3 `engine.rs::handle_event` — Exec 不清理 `applied_dirs`
+
+```rust
+EventKind::Exec => {
+    let state = tracker.get_mut(ev.pid);
+    if let Some(s) = state {
+        s.tid_names.clear();
+        s.initial_scan_done = false;
+        s.last_scan_time = 0;
+        s.applied_tids.clear();
+        // ← applied_dirs 没有清理！
+    }
+    let (n, dirs) = refresh_process_rules(...);
+    tracker.register_dirs(ev.pid, &dirs);
+```
+
+Exec 后 `refresh_process_rules` 可能使用不同的 cpuset 目录集合，新 dirs 通过 `register_dirs` 登记，但旧 `applied_dirs` 的引用计数**从未递减**。这些旧目录的引用计数永远不归零，`remove_cpuset_dir` 永远不会被调用，产生 cpuset 目录泄漏。
+
+在频繁 exec（如 Zygote 启动场景）时，`/dev/cpuset/threadctl/` 下会积累越来越多的孤儿目录。
+
+**修复**：Exec 时调用 `tracker.remove(ev.pid)` 清理旧状态（含 dir 引用）再重建，或提供专门的 `reset_dirs(pid)` 方法显式递减旧 dirs 的引用。
+
+---
+
+### 🟠 NEW-M4 `proc_source.rs` — 进程内 TID 复用导致新线程漏检
+
+```rust
+fn new_tids_for(tracker: &StateTracker, pid: i32) -> Vec<i32> {
+    let tids_now: HashSet<i32> = list_tids(pid).into_iter().collect();
+    tids_now.difference(&state.applied_tids).copied().collect()
+}
+```
+
+场景：
+1. 线程 A（tid=100）退出 → `applied_tids` 仍含 100（不主动从 applied_tids 删除）
+2. 线程 B 创建，内核分配 tid=100（TID 复用，Android 32K pid 空间，复用率不低）
+3. `new_tids_for` 计算 `tids_now - applied_tids` → 100 不在差集中 → 线程 B **未被检测**
+4. 等待下一轮全扫（TTL=2s）才收敛
+
+对音频线程、Binder 线程等频繁创建销毁的短生命周期线程，TID 复用窗口内可能漏掉调度策略应用。
+
+**修复**：`new_tids_for` 同时过滤 `list_tids` 中当前存在但 tid_names 缓存里已标记为"不可读（已退出）"的条目，或在 TTL 内缩短全扫间隔到 500ms。
+
+---
+
+## 三、新发现：低严重度
+
+### 🟡 NEW-L1 `store.rs::reinstall` — 类型错误
+
+```rust
+unsafe { libc::inotify_rm_watch(self.fd, self.wd as u32) };
+//                                              ^^^^^^^^ 错误：应为 i32，不是 u32
+```
+
+`libc::inotify_rm_watch(fd: i32, wd: i32)` — 此处 `as u32` 是类型错误。wd 始终 ≥ 0 所以值相同，但应删去强转。
+
+---
+
+### 🟡 NEW-L2 `config.rs::policy_to_rules` — `nice = 0` 被静默丢弃
+
+```rust
+if cpus.is_none() && pol.sched.is_none() && pol.nice.unwrap_or(0) == 0 {
+    return vec![];  // ← Some(0) 被误判为"未设置"
+}
+```
+
+用户显式写 `nice = 0`（如从 `nice = -10` 改回默认），无 cpus 无 sched 时规则被静默丢弃，无任何告警。`nice = 0` 是合法的显式配置（将之前改过的 nice 重置为正常）。
+
+**修复**：条件改为 `pol.nice.is_none()`。
+
+---
+
+### 🟡 NEW-L3 `topology.rs::base_cpuset_fd` — 持有不用的 fd
+
+`CpuTopology` 持有 `base_cpuset_fd: RawFd`，clone 会复制这个值，但没有 Drop 关闭。注释说"进程生命周期 fd，不主动关闭"。实际上这个 fd 只用于做 `!= -1` 的存在性检查，可以替换为 `bool cpuset_opened`，释放一个文件描述符。
+
+---
+
+### 🟡 NEW-L4 `examples/threadctl.toml` vs 内嵌默认模板不一致
+
+```toml
+# examples/threadctl.toml
+lock_interval = 5   ← 激进（每5秒重锁）
+
+# crates/core/config/threadctl.toml（嵌入二进制）
+lock_interval = 60  ← 合理默认
+```
+
+用户参考 `examples/` 时会使用 5s 间隔，产生不必要的 syscall 开销，与推荐设置矛盾。
+
+---
+
+### 🟡 NEW-L5 `audit.rs` 环形缓冲用 `Vec::remove(0)` 是 O(n)
+
+```rust
+if log.len() >= AUDIT_LOG_MAX {
+    log.remove(0);  // ← 256元素向左移位，O(256) ≈ 可接受
+}
+```
+
+小量（256）下影响微小，但 `VecDeque::pop_front` 是语义更精确的数据结构。考虑替换。
+
+---
+
+## 四、架构设计缺口（非 bug，但影响 P6.2 方向）
+
+### 🔵 DESIGN-1 `is_foreground_uid` 与 `from_sources` 脱节
+
+`foreground.rs` 的 `is_foreground_uid(uid)` 已就绪，`decision.rs::TaskIntent::from_sources(oom_adj, is_foreground, thread_hint)` 也已设计好，但主循环从未连接两者：
+
+```rust
+// main.rs — relock_all 里
+let intent = TaskIntent::from_oom_adj(read_oom_adj(pid));  // 旧路径
+// 应该是：
+// let uid = pid_uid(pid);
+// let is_fg = is_foreground_uid(uid);
+// let tname = tracker.get_thread_name(tid);
+// let intent = TaskIntent::from_sources(oom_adj, is_fg, ThreadHint::from_thread_name(&tname));
+```
+
+P5.3 声称的"多源推断"在代码里是死代码。这是 P6.2 接入时的准确入口。
+
+---
+
+### 🔵 DESIGN-2 五个问题的连锁效应
+
+以下问题在 Final 文档里被标为"遗留"，但它们的关联没有被明确指出：
+
+1. Zygote 空窗（进程刚 fork 时 cmdline 未填充）→ 导致 **Fork 事件被 `pkg.is_empty()` 过滤掉**，进程永远不进入 tracker
+2. 这个进程不在 tracker → `relock_all` 跳过它 → 规则永远不应用
+3. 直到下一轮全扫（2s）重新发现它 → 延迟 2s
+
+更严重的是：如果进程快速完成（< 2s），从未被 tracker 捕获过，规则从未应用，且这个过程**不产生任何日志**。建议 Final 文档里把这个链条写清楚，P6.2 的 pending 队列是正解。
+
+---
+
+### 🔵 DESIGN-3 `relock_all` 的 `kill(pid, 0)` SELinux 问题
+
+```rust
+if unsafe { libc::kill(pid, 0) } != 0 {
+    tracker.remove(pid);
+    continue;
+}
+```
+
+在部分 Android 设备（非 root 模式、或 SELinux 限制了 send_signal）中，`kill(pid, 0)` 对存活进程返回 EPERM（不是 ESRCH）。当前代码将 EPERM 视同进程死亡，会把**仍在运行**的进程从 tracker 中删除。
+
+建议：区分 `ESRCH`（进程不存在）和其他错误：
+
+```rust
+let alive = unsafe { libc::kill(pid, 0) } == 0
+    || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+if !alive {
+    tracker.remove(pid);
+}
+```
+
+---
+
+## 五、验证：DSV4 Flash 已发现项的当前状态
+
+| # | 项 | 代码状态 | 测试覆盖 |
+|---|---|---|---|
+| H1 merge_policy | ✅ 修复，字段级合并 | ✅ multi_pkg_rules_merge_or |
+| H2 占位规则 | ✅ H2 fix 注释确认，cpus="" 可通过 compile | ✅ sched_only_rule_is_whitelist_placeholder |
+| H3 proc_total 阈值 | ✅ FULL_SCAN_THRESHOLD=5，且改用 /proc 目录计数 | ⚠️ 无单测（集成行为） |
+| H4 tracker enter 双读 | ✅ H4 注释确认，pkg 相同快速返回 | ⚠️ 仍有 pkg 不同时双读（见 NEW tracker 分析） |
+| M5 oom_adj 阈值 | ✅ 201..=500 LatencySensitive | ✅ multi_source_intent |
+| M7 thermal 硬编码 | ✅ 改为 cooling_device 使用率 | ✅ task_score_sums |
+| L4 warn_once 无上限 | ✅ 32K 上限 + clear | ✅ 间接覆盖 |
+| L6 applied 计数含短路 | ✅ SkippedNoCpus 不计数，SHORT_CIRCUIT_TOTAL 独立计数 | ✅ |
+
+---
+
+## 六、优先修复顺序
+
+**P6.2 前必须修复（影响功能正确性）**
+
+1. **NEW-H2** uclamp 全链路静默丢失 — 配置对用户无效，但用户以为有效
+2. **NEW-H1** evaluate/decide 不一致 — P6.2 接入时必然出 bug
+3. **NEW-M1** sched_setscheduler 返回值 — 调度失败无感知
+4. **NEW-M2** Downgraded 不调 setaffinity — 线程 affinity 状态与预期不符
+5. **NEW-M3** Exec 不清理 applied_dirs — cpuset 目录泄漏
+
+**随 P6.2 修复**
+
+6. **NEW-M4** TID 复用漏检 — 短生命周期线程可能漏掉规则
+7. **DESIGN-3** kill(pid,0) SELinux 误判 — 特定设备上 tracker 会错误清空
+8. **NEW-L2** nice=0 静默丢弃 — 用户显式重置 nice 无效
+
+**低优先级清理**
+
+9. NEW-L1 inotify_rm_watch 类型错误
+10. NEW-L3 base_cpuset_fd → bool
+11. NEW-L4 examples lock_interval 不一致
+12. NEW-L5 VecDeque 替换 Vec 环形缓冲
+
+---
+
+## 七、关于 Final 文档中提给 Claude 的 5 个问题
+
+**Q1 线程规则完全独立（no-inherit 标记）**  
+当前继承语义是合理默认（field-level CSS 模型），但确实需要逃生口。推荐在 KDL 里支持 `inherit false`：
+
+```kdl
+thread "RenderThread" {
+    cluster "prime"
+    inherit false    // 不继承包级 default，仅此线程独立
+}
+```
+
+`resolve()` 检测到 `no_inherit` 标记时，跳过 `fill_missing` 步骤。
+
+**Q2 后台跳过 vs P6.2 决策引擎升级时机**  
+当前 `from_oom_adj` 阈值是正确的时效方案。游戏切后台 30s 再回来时，`relock_all` 的 `from_oom_adj` 会在下一个 60s 周期内以前台身份重新发现它。但真正的 fix 是 DESIGN-1：接入 `is_foreground_uid` + `from_sources`。建议 P6.2 的第一步就是这个连接，比 DecisionEngine 全量升级代价小得多。
+
+**Q3 cpuset 目录生命周期与 ensure 缓存**  
+存在边角 case：目录被 `rmdir` 后，`ENSURED_CPUSET_DIRS` 仍缓存其已存在，下次 `ensure_cpuset_dir` 被跳过，但目录已不存在 → cpuset tasks 写入失败。触发条件：两个进程同用一个 dir，一个退出触发 rmdir，另一个进来新线程时 ensure 被跳过。  
+修复：`remove` 时同步清理 `ENSURED_CPUSET_DIRS` 对应条目：
+
+```rust
+ENSURED_CPUSET_DIRS.lock().unwrap().remove(dir);
+```
+
+**Q4 profile fallback 语义**  
+"尽力而为"更适合 Magisk 模块场景（不同设备集群差异大），但当前 fallback 用"最大容量集群"替换，用户不可见。建议：fallback 时写 audit 条目（reason = "cluster_fallback"），让 summary 能反映出来。这比告警更适合生产环境。
+
+**Q5 audit 256 条的决策价值**  
+对于 Adjust 环节，`summary_windowed(60)` 的信息量不够：只知道"最近60秒失败率"，不知道"哪个 pkg 在哪个场景下频繁 cgroup_blocked"。建议：在 `AuditSummary` 增加 `top_blocked_pkgs: Vec<(String, usize)>`，或 `record()` 同时维护一个 `per_pkg: HashMap<String, AuditSummary>` 的实例级统计（不影响 256 条环形缓冲）。

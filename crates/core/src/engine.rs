@@ -71,16 +71,10 @@ fn handle_event(
 
             match ev.kind {
                 EventKind::Exec => {
-                    // exec 替换映像：清缓存 + 强制全线程重扫。
-                    {
-                        let state = tracker.get_mut(ev.pid);
-                        if let Some(s) = state {
-                            s.tid_names.clear();
-                            s.initial_scan_done = false;
-                            s.last_scan_time = 0;
-                            s.applied_tids.clear();
-                        }
-                    }
+                    // NEW-M3 (Claude): exec 替换映像——旧 cpuset 目录引用必须释放，
+                    // 否则 applied_dirs 引用计数永不归零 → cpuset 目录泄漏。
+                    // remove() 释放旧状态（含 dirs 引用），refresh 内部 enter 重建。
+                    tracker.remove(ev.pid);
                     let (n, dirs) =
                         refresh_process_rules(tracker, ev.pid, &pkg, cfg, now, rt_allowed, topo);
                     tracker.register_dirs(ev.pid, &dirs);
@@ -250,7 +244,7 @@ pub fn relock_all(
             Some(s) => s.pkg.clone(),
             None => continue,
         };
-        if unsafe { libc::kill(pid, 0) } != 0 {
+        if !crate::proc::is_alive(pid) {
             tracker.remove(pid);
             continue;
         }
@@ -271,7 +265,7 @@ pub fn cleanup_dead(tracker: &mut StateTracker) -> usize {
     let pids = tracker.pids();
     let mut removed = 0;
     for pid in pids {
-        if unsafe { libc::kill(pid, 0) } != 0 && tracker.remove(pid) {
+        if !crate::proc::is_alive(pid) && tracker.remove(pid) {
             removed += 1;
         }
     }

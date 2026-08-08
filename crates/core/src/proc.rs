@@ -68,6 +68,17 @@ pub fn read_oom_adj(pid: i32) -> i32 {
         .unwrap_or(0)
 }
 
+/// Process liveness (Claude DESIGN-3: kill(pid,0) may return EPERM under
+/// SELinux restrictions for an alive process — EPERM means "exists but no
+/// signal permission", must be treated as alive, otherwise running processes
+/// would be wrongly removed from the tracker).
+pub fn is_alive(pid: i32) -> bool {
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
 /// Enumerate all tids under /proc/<pid>/task.
 pub fn list_tids(pid: i32) -> Vec<i32> {
     let mut path = [0u8; 32];

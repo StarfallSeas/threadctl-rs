@@ -218,6 +218,9 @@ impl RuleSet {
                     sched,
                     sched_prio,
                     nice: rc.nice,
+                    // NEW-H2: uclamp 全链路传递（此前在此静默丢失）
+                    uclamp_min: rc.uclamp_min,
+                    uclamp_max: rc.uclamp_max,
                 },
             });
         }
@@ -410,6 +413,8 @@ fn merge_by_priority(matches: &[RuleMatch], rules: &[CompiledRule]) -> Option<Po
     let mut sched = None;
     let mut sched_prio = None;
     let mut nice = None;
+    let mut uclamp_min = None;
+    let mut uclamp_max = None;
 
     // 按 source 分组：组内 cpus OR，跨组覆盖
     let mut group_cpus = CpuSet::new();
@@ -439,6 +444,13 @@ fn merge_by_priority(matches: &[RuleMatch], rules: &[CompiledRule]) -> Option<Po
         if nice.is_none() {
             nice = r.policy.nice;
         }
+        // NEW-H2: uclamp 高优先级来源有值者生效（与 sched 一致）
+        if uclamp_min.is_none() {
+            uclamp_min = r.policy.uclamp_min;
+        }
+        if uclamp_max.is_none() {
+            uclamp_max = r.policy.uclamp_max;
+        }
     }
     if group_has_cpus && !cpus_set {
         cpus = group_cpus;
@@ -455,6 +467,8 @@ fn merge_by_priority(matches: &[RuleMatch], rules: &[CompiledRule]) -> Option<Po
         sched,
         sched_prio,
         nice,
+        uclamp_min,
+        uclamp_max,
     })
 }
 
@@ -469,6 +483,12 @@ fn fill_missing(primary: &mut Policy, fallback: &Policy) {
     }
     if primary.nice.is_none() {
         primary.nice = fallback.nice;
+    }
+    if primary.uclamp_min.is_none() {
+        primary.uclamp_min = fallback.uclamp_min;
+    }
+    if primary.uclamp_max.is_none() {
+        primary.uclamp_max = fallback.uclamp_max;
     }
 }
 

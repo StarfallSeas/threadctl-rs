@@ -115,7 +115,9 @@ impl DecisionEngine {
     pub fn evaluate(&self, intent: TaskIntent, pressure: PressureLevel, thermal_pressure: f64) -> TaskScore {
         let intent_weight = match intent {
             TaskIntent::Interactive => 50,
-            TaskIntent::BackgroundLatencySensitive => 30,
+            // NEW-H1 (Claude): BLS 权重 30→50，使 evaluate().to_action() 与 decide()
+            // 一致（BLS+Normal → Steer；BLS+Critical → Observe）
+            TaskIntent::BackgroundLatencySensitive => 50,
             TaskIntent::Background => 10,
             TaskIntent::Frozen => 0,
         };
