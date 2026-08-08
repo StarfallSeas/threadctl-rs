@@ -43,6 +43,8 @@ pub struct AuditSummary {
     pub blocked_by_perm: usize,     // EPERM
     pub downgraded: usize,          // 目标被缩减但部分生效
     pub esrch: usize,               // 线程已退出
+    /// BUG-L1 修复 (Claude)：uclamp 失败独立计数（此前静默丢弃在 _ => {} 分支）
+    pub uclamp_failed: usize,
 }
 
 impl AuditSummary {
@@ -118,8 +120,9 @@ fn summarize(log: &[AuditEntry]) -> AuditSummary {
             "cgroup" => s.blocked_by_cgroup += 1,
             "cpuset_write_failed" => s.blocked_by_cgroup += 1,
             "eperm" => s.blocked_by_perm += 1,
-            "downgraded" => s.downgraded += 1,
+            "downgraded" | "nice_failed" | "sched_failed" => s.downgraded += 1,
             "esrch" => s.esrch += 1,
+            "uclamp_failed" => s.uclamp_failed += 1,
             _ => {}
         }
     }
@@ -130,10 +133,10 @@ fn summarize(log: &[AuditEntry]) -> AuditSummary {
 pub fn summary_string() -> String {
     let s = summary_windowed(60);
     format!(
-        "audit(last60s): total={} success={} cgroup_blocked={} perm_blocked={} downgraded={} esrch={}",
+        "audit(last60s): total={} success={} cgroup_blocked={} perm_blocked={} downgraded={} esrch={} uclamp_failed={}",
         s.total_attempts, s.success,
         s.blocked_by_cgroup, s.blocked_by_perm,
-        s.downgraded, s.esrch
+        s.downgraded, s.esrch, s.uclamp_failed
     )
 }
 

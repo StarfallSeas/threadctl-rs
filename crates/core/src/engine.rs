@@ -9,6 +9,7 @@
 //! borrow from `tracker.enter` across function calls.
 
 use std::collections::HashSet;
+use std::sync::{LazyLock, Mutex};
 
 use crate::caps::can_rt_sched;
 use crate::config::ConfigSnapshot;
@@ -205,8 +206,15 @@ fn apply_single_tid(
     };
 
     let outcome = policy::apply_thread(tid, pkg, &policy, topo, rt_allowed);
-    // Claude 审查 Bug 3：SkippedNoCpus 不计数（只应用 sched）
-    if outcome == ApplyOutcome::Exited || outcome == ApplyOutcome::SkippedNoCpus {
+    // Claude 审查 Bug 3：SkippedNoCpus（sched 已应用）需更新 applied_tids 防重复
+    // BUG-M2 修复：Exited 不记录（线程已死），SkippedNoCpus 记录（防重复 syscall）
+    if outcome == ApplyOutcome::Exited {
+        return 0;
+    }
+    if outcome == ApplyOutcome::SkippedNoCpus {
+        if let Some(s) = tracker.get_mut(pid) {
+            s.applied_tids.insert(tid);
+        }
         return 0;
     }
 
@@ -231,6 +239,32 @@ pub struct RelockContext {
     pub thermal_pressure: f64,
     /// slow：审计失败率 0.0~1.0（summary_windowed(60)）
     pub audit_failure_rate: f64,
+}
+
+/// relock 决策统计（P6.2-3：Measure → Adjust 的 relock 级观测，
+/// 与 apply 级 audit 分离——决策记录不污染 apply 失败率）。
+#[derive(Debug, Default, Clone, Copy)]
+pub struct RelockStats {
+    pub allow: u64,
+    pub skip: u64,
+    pub degrade: u64,
+}
+
+static RELOCK_STATS: LazyLock<Mutex<RelockStats>> =
+    LazyLock::new(|| Mutex::new(RelockStats::default()));
+
+/// 取当前 relock 决策统计（快照）。
+pub fn relock_stats() -> RelockStats {
+    *RELOCK_STATS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn bump_relock(kind: u8) {
+    let mut s = RELOCK_STATS.lock().unwrap_or_else(|e| e.into_inner());
+    match kind {
+        0 => s.allow += 1,
+        1 => s.skip += 1,
+        _ => s.degrade += 1,
+    }
 }
 
 /// 遍历全部被跟踪进程做全线程刷新；getaffinity 短路保证空转开销小。
@@ -270,10 +304,18 @@ pub fn relock_all(
             audit_failure_rate: rctx.audit_failure_rate,
         };
         match decision.decide_ctx(&dctx) {
-            Decision::Allow { .. } => {}
-            // Skip/Degrade：跳过本轮重应用。Degrade 的 reason 已可解释
-            //（热/内存压力/审计失败），后续可进 audit（P6.2-2 记录点）。
-            Decision::Skip { .. } | Decision::Degrade { .. } => continue,
+            Decision::Allow { .. } => {
+                bump_relock(0);
+            }
+            // Skip/Degrade：跳过本轮重应用，统计原因类别（P6.2-3）
+            Decision::Skip { .. } => {
+                bump_relock(1);
+                continue;
+            }
+            Decision::Degrade { .. } => {
+                bump_relock(2);
+                continue;
+            }
         }
         let (n, dirs) = refresh_process_rules(tracker, pid, &pkg, cfg, now, rt_allowed, topo);
         tracker.register_dirs(pid, &dirs);

@@ -241,9 +241,14 @@ fn main() {
             last_fg_refresh = now;
         }
 
-        // ── M4 接入：审计摘要（60s）──
+        // ── M4 接入：审计摘要 + relock 决策统计（60s）──
         if now - last_audit >= 60 {
             println!("{}", audit::summary_string());
+            let rs = engine::relock_stats();
+            println!(
+                "relock decisions: allow={} skip={} degrade={}",
+                rs.allow, rs.skip, rs.degrade
+            );
             last_audit = now;
         }
     }

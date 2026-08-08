@@ -178,5 +178,8 @@ pub fn is_valid_profile(name: &str) -> bool {
 
 /// 可用的 profile 名列表（文档/诊断用）。
 pub fn profile_names() -> Vec<&'static str> {
-    builtin_profiles().into_keys().collect()
+    let mut names: Vec<_> = builtin_profiles().into_keys().collect();
+    // BUG-L2 修复 (Claude)：HashMap 遍历顺序不确定，排序保证输出稳定
+    names.sort();
+    names
 }

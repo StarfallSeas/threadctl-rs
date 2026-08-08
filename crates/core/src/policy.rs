@@ -152,6 +152,11 @@ pub fn apply_thread(
 ) -> ApplyOutcome {
     let mut outcome = apply_affinity(tid, pkg, policy, topo);
 
+    // BUG-M1 修复 (Claude)：线程已退出 → 早返，避免浪费 sched+uclamp syscall
+    if outcome == ApplyOutcome::Exited {
+        return outcome;
+    }
+
     if let Some(pol) = policy.sched {
         if pol.is_rt() && !rt_allowed {
             eprintln!("warning: tid={tid} needs RT scheduling but lacks CAP_SYS_NICE; sched skipped");
@@ -169,10 +174,12 @@ pub fn apply_thread(
     outcome
 }
 
-/// SCHED_FLAG_UTIL_CLAMP (include/uapi/linux/sched.h)
-const SCHED_FLAG_UTIL_CLAMP: u64 = 0x4000_0000;
-const SCHED_FLAG_UTIL_CLAMP_MIN: u64 = 0x0000_0001;
-const SCHED_FLAG_UTIL_CLAMP_MAX: u64 = 0x0000_0002;
+/// SCHED_FLAG_UTIL_CLAMP values (include/uapi/linux/sched.h, Linux 5.10+).
+/// BUG-H1 修复 (Claude)：此前用了错误的 0x4000_0000/0x01/0x02，导致
+/// sched_setattr 遇到未知 flag 位返回 EINVAL——uclamp 从未真正生效。
+const SCHED_FLAG_UTIL_CLAMP_MIN: u64 = 0x20;
+const SCHED_FLAG_UTIL_CLAMP_MAX: u64 = 0x40;
+const SCHED_FLAG_UTIL_CLAMP: u64 = 0x60;
 
 /// uclamp 能力缓存（ChatGPT V2：apply_uclamp 必须 capability 门控，
 /// 不支持的内核不反复 syscall 失败）。探测一次：/proc/sys/kernel/

@@ -11,12 +11,26 @@
 use std::collections::HashSet;
 use std::fs;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use threadctl_core::config::ConfigSnapshot;
 use threadctl_core::event::{EventSource, ProcessEvent};
 use threadctl_core::proc::{list_tids, read_cmdline};
 use threadctl_core::tracker::StateTracker;
+
+/// Zygote pending 退避间隔（ChatGPT P6.2 建议：100ms/300ms/1s 指数退避，
+/// 比固定 200ms 更符合 Android Zygote 行为——fork 后 cmdline 延迟填充）。
+const PENDING_BACKOFF_MS: [u64; 3] = [100, 300, 1000];
+const PENDING_MAX_RETRIES: u8 = 3;
+/// pending 上限：防止内核线程（cmdline 也为空）风暴占满队列。
+const PENDING_MAX_PENDING: usize = 64;
+
+/// 等待 cmdline 填充的进程（Zygote fork 空窗）。
+struct PendingProcess {
+    pid: i32,
+    retry_count: u8,
+    next_retry: Instant,
+}
 
 pub struct ProcSource {
     cfg: Option<Arc<ConfigSnapshot>>,
@@ -25,6 +39,8 @@ pub struct ProcSource {
     last_proc_total: i32,
     /// 配置变更/降级后强制全量扫描。
     scan_all: bool,
+    /// Zygote pending 队列（P6.2-3）。
+    pending: Vec<PendingProcess>,
 }
 
 impl ProcSource {
@@ -34,16 +50,60 @@ impl ProcSource {
             tracker,
             last_proc_total: -1,
             scan_all: true,
+            pending: Vec::new(),
         }
+    }
+
+    /// 处理 Zygote pending：指数退避重读 cmdline，成功则产 Fork 事件。
+    /// 重试耗尽或进程已死 → 丢弃（全扫兜底）。
+    fn flush_pending(&mut self, rules: &threadctl_core::ruleset::RuleSet, events: &mut Vec<ProcessEvent>) {
+        if self.pending.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        let mut kept: Vec<PendingProcess> = Vec::with_capacity(self.pending.len());
+        for p in std::mem::take(&mut self.pending) {
+            if now < p.next_retry {
+                kept.push(p);
+                continue;
+            }
+            if !threadctl_core::proc::is_alive(p.pid) {
+                continue; // 进程已死，丢弃
+            }
+            match read_cmdline(p.pid) {
+                Some(pkg) if !pkg.is_empty() => {
+                    if rules.is_interested(&pkg) {
+                        events.push(ProcessEvent::fork(p.pid, p.pid).with_pkg(pkg));
+                    }
+                    // 成功（无论是否白名单）→ 出队
+                }
+                _ => {
+                    if p.retry_count < PENDING_MAX_RETRIES {
+                        let delay = PENDING_BACKOFF_MS[p.retry_count as usize];
+                        kept.push(PendingProcess {
+                            pid: p.pid,
+                            retry_count: p.retry_count + 1,
+                            next_retry: now + Duration::from_millis(delay),
+                        });
+                    }
+                    // 重试耗尽 → 丢弃（全扫兜底）
+                }
+            }
+        }
+        self.pending = kept;
     }
 
     /// 单轮收集：产出发现的事件。
     fn collect(&mut self) -> Vec<ProcessEvent> {
-        let Some(cfg) = &self.cfg else {
+        // clone Arc：避免 &self.cfg 借用与 &mut self（flush_pending）冲突
+        let Some(cfg) = self.cfg.clone() else {
             return Vec::new();
         };
         let rules = &cfg.rules;
         let mut events = Vec::new();
+
+        // P6.2-3：先处理 Zygote pending（指数退避重读 cmdline）
+        self.flush_pending(rules, &mut events);
 
         // Android 专项审查 🔴A：Bionic 的 sysinfo.procs 返回**任务数（含线程）**
         // （SM8550 实测 1000+），线程创建/退出是常态 → procs 每轮必变 → 每轮全扫。
@@ -70,7 +130,36 @@ impl ProcSource {
                     continue;
                 };
                 current_pids.insert(pid);
-                let Some(pkg) = read_cmdline(pid) else { continue };
+                // P6.2-3：Zygote fork 空窗——fork 后 cmdline 短暂为空。
+                // 空/读失败 → 入 pending 队列（指数退避重试），不直接丢弃。
+                let Some(pkg) = read_cmdline(pid) else {
+                    // BUG-M4 修复 (Claude)：全扫发现非跟踪 pid 且 cmdline 空时，
+                    // 必须检查是否已在 pending 队列（flush_pending 保留项 + 重试）
+                    if self.pending.len() < PENDING_MAX_PENDING
+                        && !self.tracker.lock().unwrap_or_else(|e| e.into_inner()).contains(pid)
+                        && !self.pending.iter().any(|p| p.pid == pid)
+                    {
+                        self.pending.push(PendingProcess {
+                            pid,
+                            retry_count: 0,
+                            next_retry: Instant::now(),
+                        });
+                    }
+                    continue;
+                };
+                if pkg.is_empty() {
+                    if self.pending.len() < PENDING_MAX_PENDING
+                        && !self.tracker.lock().unwrap_or_else(|e| e.into_inner()).contains(pid)
+                        && !self.pending.iter().any(|p| p.pid == pid)
+                    {
+                        self.pending.push(PendingProcess {
+                            pid,
+                            retry_count: 0,
+                            next_retry: Instant::now(),
+                        });
+                    }
+                    continue;
+                }
                 if !rules.is_interested(&pkg) {
                     continue;
                 }

@@ -112,9 +112,9 @@ impl DecisionEngine {
     /// `thermal_pressure`：冷却设备使用率 0.0~1.0（M7 修复，替代硬编码温度阈值）。
     pub fn evaluate(&self, intent: TaskIntent, pressure: PressureLevel, thermal_pressure: f64) -> TaskScore {
         let intent_weight = match intent {
-            TaskIntent::Interactive => 50,
-            // NEW-H1 (Claude): BLS 权重 30→50，使 evaluate().to_action() 与 decide()
-            // 一致（BLS+Normal → Steer；BLS+Critical → Observe）
+            // 分析项-L3 (Claude)：Interactive 50→60，Moderate 压力下降级门槛提高
+            //（60−15=45>40→仍 Steer），仅在 Critical 降级（60−40=20<40→Observe）
+            TaskIntent::Interactive => 60,
             TaskIntent::BackgroundLatencySensitive => 50,
             TaskIntent::Background => 10,
             TaskIntent::Frozen => 0,
@@ -159,6 +159,8 @@ pub enum MigrateAction {
 pub enum Reason {
     /// 前台交互进程，正常干预
     ForegroundInteractive,
+    /// 延迟敏感后台（Binder 服务、音频线程），允许干预
+    LatencySensitive,
     /// 后台进程（不干预，省电 + 交还调度器）
     Background,
     /// 冻结进程（永不干预）
@@ -226,7 +228,10 @@ impl DecisionEngine {
         match ctx.intent {
             TaskIntent::Frozen => return Decision::Skip { reason: Reason::Frozen },
             TaskIntent::Background => return Decision::Skip { reason: Reason::Background },
-            _ => {}
+            // BUG-M3 修复 (Claude)：BLS 单独归因 LatencySensitive，
+            // 不再混入 ForegroundInteractive——审计闭环需要区分前台游戏与后台 Binder 服务
+            TaskIntent::BackgroundLatencySensitive => {} // 继续评估压力/热/审计
+            TaskIntent::Interactive => {}
         }
         if ctx.thermal_pressure > 0.8 {
             return Decision::Degrade { level: DegradeLevel::Relax, reason: Reason::ThermalPressure };
@@ -237,7 +242,12 @@ impl DecisionEngine {
         if self.pressure_sensitive && ctx.pressure == PressureLevel::Critical {
             return Decision::Degrade { level: DegradeLevel::Relax, reason: Reason::MemoryPressure };
         }
-        Decision::Allow { reason: Reason::ForegroundInteractive }
+        // BUG-M3 修复：BLS 归因 LatencySensitive
+        let reason = match ctx.intent {
+            TaskIntent::BackgroundLatencySensitive => Reason::LatencySensitive,
+            _ => Reason::ForegroundInteractive,
+        };
+        Decision::Allow { reason }
     }
 }
 
@@ -257,11 +267,11 @@ mod tests {
 
     #[test]
     fn interactive_steers_until_pressure() {
-        // NEW-H1 终版语义：Interactive 正常/中度压力下 Steer，
-        // Critical 压力下压力感知降级 Observe（evaluate 路径）
+        // L3 修正 (Claude)：Interactive 60→Moderate 60-15=45>40→仍 Steer；
+        // 仅在 Critical 降级 60-40=20<40→Observe
         let e = DecisionEngine::default();
         assert_eq!(e.decide(TaskIntent::Interactive, PressureLevel::Normal), ActionLevel::Steer);
-        assert_eq!(e.decide(TaskIntent::Interactive, PressureLevel::Moderate), ActionLevel::Observe);
+        assert_eq!(e.decide(TaskIntent::Interactive, PressureLevel::Moderate), ActionLevel::Steer);
         assert_eq!(e.decide(TaskIntent::Interactive, PressureLevel::Critical), ActionLevel::Observe);
     }
 
@@ -323,7 +333,7 @@ mod tests {
         let e = DecisionEngine::default();
         // M7 修复后：第三参数为冷却设备使用率（0.0~1.0）
         let s = e.evaluate(TaskIntent::Interactive, PressureLevel::Normal, 0.1);
-        assert_eq!(s.total, 50); // 50+0+0
+        assert_eq!(s.total, 60, "L3: Interactive weight 50→60");
         let s2 = e.evaluate(TaskIntent::Background, PressureLevel::Critical, 0.9);
         assert_eq!(s2.total, 0); // 10-40-20 → 0 (clamped)
     }
@@ -405,7 +415,8 @@ mod tests {
         );
         assert_eq!(
             e.decide_ctx(&ctx(TaskIntent::BackgroundLatencySensitive)),
-            Decision::Allow { reason: Reason::ForegroundInteractive }
+            Decision::Allow { reason: Reason::LatencySensitive },
+            "BUG-M3 修复：BLS Allow 归因 LatencySensitive，不再混入 ForegroundInteractive"
         );
     }
 
@@ -429,8 +440,8 @@ mod tests {
         c.pressure = PressureLevel::Moderate;
         assert_eq!(
             e.decide_ctx(&c),
-            Decision::Allow { reason: Reason::ForegroundInteractive },
-            "Moderate 压力不应降级（保留干预，与 H1 语义一致）"
+            Decision::Allow { reason: Reason::LatencySensitive },
+            "Moderate 压力不应降级，BLS 归因 LatencySensitive（M3 修复）"
         );
     }
 }
