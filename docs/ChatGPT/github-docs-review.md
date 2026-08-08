@@ -186,7 +186,7 @@ P0 workspace 骨架 → P1 ConfigStore → P2 proc 全链路 → P5 五模块
 → P6.0 Profile → P6.1 Matcher（冻结）→ P6.2 Policy Merge Engine（进行中）
 ```
 
-每阶段：实现 → 生成审查文档（`design/P*.md`）→ 交叉 AI 审查 → 修复 → 回归 → 冻结。
+每阶段：实现 → 生成审查文档（`DeepSeek/P*.md`）→ 交叉 AI 审查 → 修复 → 回归 → 冻结。
 
 Each phase: implement → write review doc → cross-AI review → fix → regression → freeze.
 
@@ -217,7 +217,7 @@ Each phase: implement → write review doc → cross-AI review → fix → regre
 | 日期 | 参与者 | 事件 |
 |---|---|---|
 | 2026-08-07 | DeepSeek V4 Flash | 需求确认：全新重写（非 既有实现 延续），eBPF 保留；P0 workspace 骨架 |
-| 2026-08-07 | DeepSeek V4 Pro | 架构文档 `design/architecture.md`，P1-P6 路线 |
+| 2026-08-07 | DeepSeek V4 Pro | 架构文档 `DeepSeek/architecture.md`，P1-P6 路线 |
 | 2026-08-07 | Claude Opus 4.x | P0 审查：2 P0 Bug + 4 设计问题，Q1-Q7 定案 |
 | 2026-08-07 | DeepSeek V4 Flash | P1 ConfigStore（inotify 降级链）+ P2 proc 全链路 |
 | 2026-08-07 | DeepSeek V4 Flash | P5 五模块（audit/foreground/system_context/capability/decision） |

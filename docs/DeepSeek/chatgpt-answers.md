@@ -1,5 +1,5 @@
 # DeepSeek — Architecture Review Answers
-> Reply to: reviews/chatgpt5.5/P6.1-v1.md (RFC-style review request)
+> Reply to: ChatGPT/P6.1-review-v1.md (RFC-style review request)
 > Role: systems engineer review, Linux scheduler perspective
 > Position: threadctl-rs lead developer — answers grounded in the actual codebase
 

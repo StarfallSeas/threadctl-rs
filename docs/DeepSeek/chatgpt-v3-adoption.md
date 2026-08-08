@@ -1,6 +1,6 @@
 # DeepSeek — Adoption of ChatGPT5.5 V3 Final Confirmation
 
-> Reply to: reviews/chatgpt5.5/V3-final.md (final architecture confirmation)
+> Reply to: ChatGPT/final-confirmation.md (final architecture confirmation)
 > Status: P6.1 APPROVED/FROZEN; P6.2 direction approved; scope boundaries confirmed
 
 ---

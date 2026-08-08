@@ -202,9 +202,9 @@ threadctl-rs/
 │   └── ebpf/             # bin：内核态（空骨架，待迁移）
 │       └── src/main.rs   # no_std 占位
 ├── docs/
-│   ├── design/           # 架构/阶段设计（本文档）
-│   ├── reviews/          # 外部 AI 审查原文（claude/ + chatgpt5.5/）
-│   ├── responses/        # DeepSeek 回应/采纳记录
+│   ├── DeepSeek/         # 架构/阶段设计 + 回应采纳（本文档）
+│   ├── ChatGPT/          # ChatGPT 审查原文
+│   ├── Claude/           # Claude 审查原文
 │   ├── matcher.md        # matcher 设计（冻结）
 │   ├── repo-overview.md  # 仓库结构概览
 │   └── ai-review-process.md
@@ -265,7 +265,7 @@ threadctl-rs/
 
 ## 9. Claude 审查结论与决策记录
 
-> 审查来源：`reviews/claude/initial.md`。结论：架构方向正确，分层清晰。发现 2 个 P0 Bug、
+> 审查来源：`Claude/initial-review.md`。结论：架构方向正确，分层清晰。发现 2 个 P0 Bug、
 > 4 个重要设计问题、若干次要问题。**全部已修复并验证。**
 
 ### 9.1 已修复项
@@ -305,7 +305,7 @@ threadctl-rs/
 | 2026-08-07 | 完成需求确认：全新程序 threadctl v2（非 既有实现 延续），eBPF 内核态保留并扩展 |
 | 2026-08-07 | 备份并清空旧 threadctl-rs，P0 workspace 骨架完成（core/daemon/ebpf） |
 | 2026-08-07 | 架构文档生成，交 Claude 审查 |
-| 2026-08-07 | Claude 审查返回（reviews/claude/initial.md）：2 Bug + 4 设计问题 + 若干次要，全部修复，Q1-Q7 定案 |
+| 2026-08-07 | Claude 审查返回（Claude/initial-review.md）：2 Bug + 4 设计问题 + 若干次要，全部修复，Q1-Q7 定案 |
 | 2026-08-07 | P1 完成：ConfigStore 热加载（inotify→轮询降级链）+ 快照版本化 + daemon 接入，5 单测 + 真实冒烟通过 |
 | 2026-08-07 | 本文档覆盖更新，同步进度（本次） |
 | 2026-08-08 | P2 完成：ProcSource + StateTracker + Policy 全链路（含 Q6 权限检查、relock）；三层过滤修复（online + allowed 交集） |

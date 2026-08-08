@@ -25,7 +25,9 @@ threadctl-rs/
 ├── docs/
 │   ├── matcher.md              # matcher 设计文档（冻结）
 │   ├── ai-review-process.md    # 开发/审查流程
-│   └── reviews/                # AI 审查原始记录（10 份）
+│   ├── DeepSeek/               # 架构/阶段设计 + 回应采纳
+│   ├── ChatGPT/                # ChatGPT 审查原文
+│   └── Claude/                 # Claude 审查原文
 ├── examples/
 │   ├── threadctl.kdl           # 完整 KDL 示例
 │   ├── user-mode.kdl           # 用户模式模板
