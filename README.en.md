@@ -216,6 +216,29 @@ app "com.example.game" {
 
 ---
 
+## Architecture Invariants
+
+**threadctl-rs will not**:
+
+- replace Android LMKD (memory management)
+- freeze applications or kill background processes
+- migrate tasks automatically
+- replace the Linux scheduler
+
+**threadctl-rs provides**:
+
+- thread affinity control
+- scheduler attribute control (sched / nice)
+- uclamp constraints
+- policy-based execution hints
+- observability (audit / telemetry)
+
+> User space provides **constraints**, not **replacement policy** — the kernel
+> already has wakeup migration, load balancing, PELT, EAS and uclamp with full
+> information.
+
+---
+
 ## Safety
 
 - **No kernel patch required**: pure user-space syscalls; no kernel modification

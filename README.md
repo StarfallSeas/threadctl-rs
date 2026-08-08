@@ -222,6 +222,28 @@ app "com.example.game" {
 
 ---
 
+## 架构不变量（Architecture Invariants）
+
+**threadctl-rs 不会**：
+
+- 取代 Android LMKD（内存管理）
+- 冻结应用（freeze）或杀死后台进程（kill）
+- 自动迁移任务（migrate）
+- 取代 Linux 调度器
+
+**threadctl-rs 提供**：
+
+- 线程亲和性控制（affinity）
+- 调度属性控制（sched / nice）
+- uclamp 约束
+- 基于策略的执行提示
+- 可观测性（audit / telemetry）
+
+> 用户态提供的是 **constraint（约束）**，不是 **replacement policy（替代策略）**——
+> 内核已拥有 wakeup migration、load balancing、PELT、EAS、uclamp 的完整信息。
+
+---
+
 ## 测试与质量
 
 - **46 单测**：matcher 继承语义、specificity 排序、实例级缓存（1000 通配 × 10000 resolve）、审计环形、配置合并、profile 展开、热加载版本化

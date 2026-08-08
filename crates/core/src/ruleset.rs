@@ -45,7 +45,7 @@ use std::sync::Mutex;
 
 use crate::config::{RuleConfig, SchedSpec};
 use crate::policy::Policy;
-use crate::topology::{parse_cpu_ranges, CpuSet, CpuTopology, MAX_PKG_LEN, MAX_THREAD_LEN};
+use crate::topology::{parse_cpu_ranges, CpuTopology, MAX_PKG_LEN, MAX_THREAD_LEN};
 
 /// Rule source. Priority is **explicit** via `RuleSource::priority()` —
 /// never derive Ord: enum declaration order is fragile (inserting a variant
@@ -92,13 +92,13 @@ pub struct RuleMatch {
     pub source: RuleSource,
 }
 
-/// 编译期规则（含预计算的 fnmatch 模式）。
+/// Compiled rule (pub(crate): merge.rs reads policy fields for merging).
 #[derive(Clone)]
-struct CompiledRule {
-    pkg: String,
-    thread: String,
-    thread_pattern: Option<CString>,
-    policy: Policy,
+pub(crate) struct CompiledRule {
+    pub(crate) pkg: String,
+    pub(crate) thread: String,
+    pub(crate) thread_pattern: Option<CString>,
+    pub(crate) policy: Policy,
 }
 
 /// 通配符包名规则组。
@@ -337,12 +337,18 @@ impl RuleSet {
         self.collect_pkg_matches(pkg)
     }
 
+    /// 测试观察用：访问编译后的规则（merge.rs 单测注入用）。
+    #[cfg(test)]
+    pub(crate) fn rules_for_test(&self) -> &[CompiledRule] {
+        &self.rules
+    }
+
     /// 解析 (pkg, thread) → 策略。
     ///
     /// 分层（GPT 审查）：
     /// 1. **PackageMatcher**：`collect_pkg_matches` — 收集 exact + wildcard（并存）
     /// 2. **ThreadMatcher**：线程规则 fnmatch 命中集（跨来源）；miss 时用包级规则集
-    /// 3. **PolicyMerge**：`merge_by_priority` — 字段级覆盖合并（CSS 模型）：
+    /// 3. **PolicyMerge**（merge.rs）：`merge_rules` — 字段级覆盖合并（CSS 模型）：
     ///    - 高优先级来源字段覆盖低优先级来源（exact 覆盖 wildcard）
     ///    - 低优先级来源填充高优先级未设置的字段（inheritance）
     ///    - 同来源组内 cpus 按位或、sched/nice 首个生效（兼容语义）
@@ -374,14 +380,14 @@ impl RuleSet {
             .collect();
 
         let mut policy = if !thread_hits.is_empty() {
-            let mut pol = merge_by_priority(&thread_hits, &self.rules)?;
+            let mut pol = crate::merge::merge_rules(&thread_hits, &self.rules)?;
             // 继承：包级规则填充线程规则未设置的字段
-            if let Some(fb) = merge_by_priority(&pkg_rules, &self.rules) {
-                fill_missing(&mut pol, &fb);
+            if let Some(fb) = crate::merge::merge_rules(&pkg_rules, &self.rules) {
+                crate::merge::fill_missing(&mut pol, &fb);
             }
             pol
         } else {
-            merge_by_priority(&pkg_rules, &self.rules)?
+            crate::merge::merge_rules(&pkg_rules, &self.rules)?
         };
 
         // H2：cpus 为空但有 sched/nice 时仍返回策略（仅应用调度属性）
@@ -393,104 +399,6 @@ impl RuleSet {
         policy.cpuset_dir = policy.cpus.to_range_string();
 
         Some(policy)
-    }
-}
-
-/// PolicyMerge（GPT 第三次审查：字段级覆盖合并，CSS 模型）。
-///
-/// - 输入按 source 降序（高优先级在前；同 source 保持插入序）
-/// - **cpus**：最高优先级**组**的 cpus 生效（组内多条 OR 合并）；
-///   低优先级组的 cpus 仅在该字段未被设置时填充（inheritance）
-/// - **sched/nice**：highest-priority source that has a value wins
-///   （首个有值者生效——exact 无 sched 时 wildcard 的 sched 被继承，
-///   这是"继承"而非"覆盖"，Claude 审查 Bug 6）
-fn merge_by_priority(matches: &[RuleMatch], rules: &[CompiledRule]) -> Option<Policy> {
-    let mut sorted: Vec<&RuleMatch> = matches.iter().collect();
-    sorted.sort_by_key(|m| std::cmp::Reverse(m.source.priority()));
-
-    let mut cpus = CpuSet::new();
-    let mut cpus_set = false;
-    let mut sched = None;
-    let mut sched_prio = None;
-    let mut nice = None;
-    let mut uclamp_min: Option<u32> = None;
-    let mut uclamp_max: Option<u32> = None;
-
-    // 按 source 分组：组内 cpus OR，跨组覆盖
-    let mut group_cpus = CpuSet::new();
-    let mut group_has_cpus = false;
-    let mut cur_source: Option<RuleSource> = None;
-
-    for m in sorted {
-        let r = &rules[m.index];
-        if cur_source != Some(m.source) {
-            // flush 上一组：若本组有 cpus 且最终未定 → 采纳组 OR 结果
-            if group_has_cpus && !cpus_set {
-                cpus = group_cpus;
-                cpus_set = true;
-            }
-            group_cpus = CpuSet::new();
-            group_has_cpus = false;
-            cur_source = Some(m.source);
-        }
-        if r.policy.cpus.count() > 0 {
-            group_cpus.or(&r.policy.cpus);
-            group_has_cpus = true;
-        }
-        if sched.is_none() && r.policy.sched.is_some() {
-            sched = r.policy.sched;
-            sched_prio = r.policy.sched_prio;
-        }
-        if nice.is_none() {
-            nice = r.policy.nice;
-        }
-        // ChatGPT V3: uclamp 是**约束合并**而非 FirstWins——
-        // uclamp_min 取跨来源最大值（保底累积：所有来源的保底都满足），
-        // uclamp_max 取跨来源最小值（上限累积：所有来源的上限都满足）。
-        if let Some(m) = r.policy.uclamp_min {
-            uclamp_min = Some(uclamp_min.map_or(m, |cur| cur.max(m)));
-        }
-        if let Some(m) = r.policy.uclamp_max {
-            uclamp_max = Some(uclamp_max.map_or(m, |cur| cur.min(m)));
-        }
-    }
-    if group_has_cpus && !cpus_set {
-        cpus = group_cpus;
-        cpus_set = true;
-    }
-
-    if !cpus_set && sched.is_none() && nice.is_none() {
-        return None;
-    }
-
-    Some(Policy {
-        cpus,
-        cpuset_dir: cpus.to_range_string(),
-        sched,
-        sched_prio,
-        nice,
-        uclamp_min,
-        uclamp_max,
-    })
-}
-
-/// 用 fallback 的字段填充 primary 未设置的字段（inheritance）。
-fn fill_missing(primary: &mut Policy, fallback: &Policy) {
-    if primary.cpus.count() == 0 {
-        primary.cpus = fallback.cpus;
-    }
-    if primary.sched.is_none() {
-        primary.sched = fallback.sched;
-        primary.sched_prio = fallback.sched_prio;
-    }
-    if primary.nice.is_none() {
-        primary.nice = fallback.nice;
-    }
-    if primary.uclamp_min.is_none() {
-        primary.uclamp_min = fallback.uclamp_min;
-    }
-    if primary.uclamp_max.is_none() {
-        primary.uclamp_max = fallback.uclamp_max;
     }
 }
 
