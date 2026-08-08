@@ -699,6 +699,24 @@ mod tests {
     }
 
     #[test]
+    fn uclamp_flows_through_resolve() {
+        // NEW-H2 regression (Claude): uclamp must survive config → compile → resolve
+        let rules = vec![RuleConfig {
+            pkg: "com.x".into(),
+            thread: String::new(),
+            cpus: "0-1".into(),
+            sched: None,
+            nice: None,
+            uclamp_min: Some(700),
+            uclamp_max: Some(1024),
+        }];
+        let rs = RuleSet::compile(&rules, &topo()).rules;
+        let p = rs.resolve("com.x", "").expect("resolve");
+        assert_eq!(p.uclamp_min, Some(700), "uclamp_min must not be dropped");
+        assert_eq!(p.uclamp_max, Some(1024), "uclamp_max must not be dropped");
+    }
+
+    #[test]
     fn cache_hits_after_first_resolve() {
         // 缓存后 resolve 不再扫描 wildcard
         let mut rules = Vec::new();

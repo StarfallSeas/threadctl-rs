@@ -98,16 +98,14 @@ impl Default for DecisionEngine {
 }
 
 impl DecisionEngine {
+    /// 决策入口（NEW-H1 终版：decide 完全等价 evaluate(thermal=0).to_action，
+    /// 消除双路径不一致——Interactive 在高压下降级 Observe、Background 不再
+    /// 无条件干预，都是压力感知的正确语义）。
     pub fn decide(&self, intent: TaskIntent, pressure: PressureLevel) -> ActionLevel {
-        if self.force_affinity_enabled { return ActionLevel::Force; }
-        match (intent, pressure) {
-            (TaskIntent::Interactive, _) => ActionLevel::Steer,
-            (TaskIntent::BackgroundLatencySensitive, PressureLevel::Critical) => ActionLevel::Observe,
-            (TaskIntent::BackgroundLatencySensitive, _) => ActionLevel::Steer,
-            (TaskIntent::Background, PressureLevel::Normal) => ActionLevel::Steer,
-            (TaskIntent::Background, _) => ActionLevel::Observe,
-            (TaskIntent::Frozen, _) => ActionLevel::Observe,
+        if self.force_affinity_enabled {
+            return ActionLevel::Force;
         }
+        self.evaluate(intent, pressure, 0.0).to_action(false)
     }
 
     /// 带权重的详细决策（P5.4）。
@@ -156,17 +154,49 @@ mod tests {
     use super::*;
 
     #[test]
-    fn interactive_always_steer() {
+    fn interactive_steers_until_pressure() {
+        // NEW-H1 终版语义：Interactive 正常/中度压力下 Steer，
+        // Critical 压力下压力感知降级 Observe（evaluate 路径）
         let e = DecisionEngine::default();
         assert_eq!(e.decide(TaskIntent::Interactive, PressureLevel::Normal), ActionLevel::Steer);
-        assert_eq!(e.decide(TaskIntent::Interactive, PressureLevel::Critical), ActionLevel::Steer);
+        assert_eq!(e.decide(TaskIntent::Interactive, PressureLevel::Moderate), ActionLevel::Observe);
+        assert_eq!(e.decide(TaskIntent::Interactive, PressureLevel::Critical), ActionLevel::Observe);
     }
 
     #[test]
-    fn background_downgrades_under_pressure() {
+    fn background_observes() {
+        // NEW-H1 终版语义：Background 权重 10 < 阈值 40，任何压力下都 Observe
+        // （与 relock 后台跳过语义一致，不再无条件干预）
         let e = DecisionEngine::default();
-        assert_eq!(e.decide(TaskIntent::Background, PressureLevel::Normal), ActionLevel::Steer);
+        assert_eq!(e.decide(TaskIntent::Background, PressureLevel::Normal), ActionLevel::Observe);
         assert_eq!(e.decide(TaskIntent::Background, PressureLevel::Critical), ActionLevel::Observe);
+    }
+
+    #[test]
+    fn decide_matches_evaluate_full_matrix() {
+        // NEW-H1 regression：decide 与 evaluate().to_action() 全矩阵一致
+        let e = DecisionEngine::default();
+        let intents = [
+            TaskIntent::Interactive,
+            TaskIntent::BackgroundLatencySensitive,
+            TaskIntent::Background,
+            TaskIntent::Frozen,
+        ];
+        let pressures = [
+            PressureLevel::Normal,
+            PressureLevel::Moderate,
+            PressureLevel::Critical,
+        ];
+        for intent in intents {
+            for pressure in pressures {
+                let via_decide = e.decide(intent, pressure);
+                let via_evaluate = e.evaluate(intent, pressure, 0.0).to_action(false);
+                assert_eq!(
+                    via_decide, via_evaluate,
+                    "decide/evaluate mismatch: {intent:?} + {pressure:?}"
+                );
+            }
+        }
     }
 
     #[test]
