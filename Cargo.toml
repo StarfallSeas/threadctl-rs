@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = ["crates/core", "crates/daemon", "crates/ebpf"]
+
+[workspace.package]
+version = "2.0.0"
+edition = "2021"
+license = "GPL-3.0"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+
+# eBPF 内核态用 size 优先
+[profile.release.package.threadctl-ebpf]
+opt-level = "s"

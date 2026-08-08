@@ -1,0 +1,52 @@
+# threadctl-rs 默认配置模板
+
+[daemon]
+pid_file = "./run/threadctl.pid"
+ipc_socket = "./run/threadctl.sock"
+# trace | debug | info | warn | error
+log_level = "info"
+
+[engine]
+# auto | ebpf | proc | hybrid
+mode = "auto"
+
+# 秒；/proc 轮询间隔（仅 proc/hybrid 模式）
+scan_interval = 2
+
+# 秒；周期重锁定（仅兜底，主力为事件驱动）。0=禁用。
+lock_interval = 60
+
+# 秒；死进程清理间隔
+dead_cleanup_interval = 15
+
+# ── 推荐配置格式：[app] ──────────────────────────────
+# 一个 APP 写一次包名，线程覆盖写在 threads 子表内。
+#
+# [app."com.example.game"]
+# cpus = "0-6"              # 默认所有线程
+# sched = "fifo:60"
+#
+# [app."com.example.game".threads.RenderThread]
+# cpus = "7"                # 只覆盖这个线程
+# sched = "fifo:60"
+# nice = -10
+#
+# [app."com.example.game".threads.AudioThread]
+# cpus = "0-3"
+# nice = -5
+
+# ── 兼容旧格式：[[rule]] ──────────────────────────────
+# [[rule]]
+# pkg = "com.example.app"
+# cpus = "0-3"
+#
+# [[rule]]
+# pkg = "com.example.app"
+# thread = "RenderThread"
+# cpus = "4-7"
+# sched = "fifo:60"
+# nice = -10
+
+# Magisk 模块建议使用绝对路径：
+# pid_file = "/data/adb/modules/threadctl/run/threadctl.pid"
+# ipc_socket = "/data/adb/modules/threadctl/run/threadctl.sock"

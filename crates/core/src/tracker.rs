@@ -1,0 +1,254 @@
+//! StateTracker — process/thread state tracking (Q5 thread-name cache + Q3 cpuset refcounts).
+//!
+//! Replaces 既有实现's scattered `process_cache` / `ProcCache` / global 60s cache cleanup:
+//! - Thread-name cache is **per-process** (TTL 60s, timers naturally stagger, no global
+//!   cleanup spike); exec invalidates it actively, process exit clears it
+//! - cpuset dir refcounts: `dir_name → refcount`, zero triggers `remove_cpuset_dir`
+
+use std::collections::{HashMap, HashSet};
+
+use crate::proc::{read_start_time, read_thread_name};
+use crate::topology::{remove_cpuset_dir, BASE_CPUSET};
+
+/// 线程名缓存 TTL（秒）。
+const THREAD_NAME_CACHE_TTL_SECS: i64 = 60;
+
+/// 每进程线程名缓存（Q5 定案）。
+#[derive(Default)]
+pub struct ThreadNameCache {
+    names: HashMap<i32, String>,
+    last_full_refresh: i64,
+}
+
+impl ThreadNameCache {
+    pub fn new(now: i64) -> Self {
+        Self { names: HashMap::new(), last_full_refresh: now }
+    }
+
+    /// 取或读线程名；TTL 到期清空本缓存（每进程粒度）。
+    pub fn get_or_read(&mut self, tid: i32, now: i64) -> &str {
+        if now - self.last_full_refresh >= THREAD_NAME_CACHE_TTL_SECS {
+            self.names.clear();
+            self.last_full_refresh = now;
+        }
+        self.names
+            .entry(tid)
+            .or_insert_with(|| read_thread_name(tid).unwrap_or_default())
+    }
+
+    /// exec 主动失效（Q5：避免旧线程名污染）。
+    pub fn clear(&mut self) {
+        self.names.clear();
+        self.last_full_refresh = 0;
+    }
+
+    /// 进程线程集收缩时清掉失效条目。
+    pub fn retain(&mut self, tids: &HashSet<i32>) {
+        self.names.retain(|&tid, _| tids.contains(&tid));
+    }
+}
+
+/// 单个被跟踪进程的状态。
+pub struct ProcessState {
+    pub pid: i32,
+    pub pkg: String,
+    /// 进程启动时间（/proc/pid/stat starttime），用于 PID 复用检测。
+    pub start_time: u64,
+    /// 是否已完成首轮全线程扫描。
+    pub initial_scan_done: bool,
+    /// 最近一次全线程扫描时间（单调秒）。
+    pub last_scan_time: i64,
+    /// 已应用的线程集合（增量检测新线程用）。
+    pub applied_tids: HashSet<i32>,
+    /// 本进程贡献过引用的 cpuset 目录。
+    pub applied_dirs: HashSet<String>,
+    pub tid_names: ThreadNameCache,
+}
+
+impl ProcessState {
+    fn new(pid: i32, start_time: u64, pkg: String, now: i64) -> Self {
+        Self {
+            pid,
+            pkg,
+            start_time,
+            initial_scan_done: false,
+            last_scan_time: 0,
+            applied_tids: HashSet::new(),
+            applied_dirs: HashSet::new(),
+            tid_names: ThreadNameCache::new(now),
+        }
+    }
+}
+
+/// 全局跟踪器。
+#[derive(Default)]
+pub struct StateTracker {
+    procs: HashMap<i32, ProcessState>,
+    /// cpuset 目录名 → 引用计数。
+    cpuset_refs: HashMap<String, u32>,
+}
+
+impl StateTracker {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn get(&self, pid: i32) -> Option<&ProcessState> {
+        self.procs.get(&pid)
+    }
+
+    pub fn get_mut(&mut self, pid: i32) -> Option<&mut ProcessState> {
+        self.procs.get_mut(&pid)
+    }
+
+    pub fn contains(&self, pid: i32) -> bool {
+        self.procs.contains_key(&pid)
+    }
+
+    pub fn pids(&self) -> Vec<i32> {
+        self.procs.keys().copied().collect()
+    }
+
+    pub fn len(&self) -> usize {
+        self.procs.len()
+    }
+
+    /// 进入/更新进程状态（不存在则创建）。
+    ///
+    /// H4 修复：已跟踪且 pkg 相同 → 零 I/O 快速返回（不再每轮读 /proc/<pid>/stat）。
+    /// pkg 不同时读 start_time 做 PID 复用检测，并顺带更新 pkg（exec 后包名变化）。
+    pub fn enter(&mut self, pid: i32, pkg: String, now: i64) -> &mut ProcessState {
+        if let Some(existing) = self.procs.get(&pid) {
+            if existing.pkg != pkg && existing.start_time != 0 {
+                // pkg 变化：可能是 exec（start_time 不变）或 PID 复用（start_time 变）
+                let st = read_start_time(pid).unwrap_or(0);
+                if st > 0 && st != existing.start_time {
+                    // PID 复用：旧进程已退出，释放旧状态（含 cpuset 引用）
+                    self.remove(pid);
+                } else {
+                    // 同一进程：更新 pkg
+                    let existing = self.procs.get_mut(&pid).unwrap();
+                    existing.pkg = pkg;
+                    return existing;
+                }
+            } else {
+                return self.procs.get_mut(&pid).unwrap();
+            }
+        }
+        let st = read_start_time(pid).unwrap_or(0);
+        self.procs
+            .insert(pid, ProcessState::new(pid, st, pkg, now));
+        self.procs.get_mut(&pid).unwrap()
+    }
+
+    /// 移除进程：释放其全部 cpuset 引用，归零目录 rmdir 回收。
+    pub fn remove(&mut self, pid: i32) -> bool {
+        let Some(state) = self.procs.remove(&pid) else {
+            return false;
+        };
+        for dir in &state.applied_dirs {
+            if dir.is_empty() {
+                continue;
+            }
+            if let Some(n) = self.cpuset_refs.get_mut(dir) {
+                *n = n.saturating_sub(1);
+                if *n == 0 {
+                    self.cpuset_refs.remove(dir);
+                    let path = format!("{BASE_CPUSET}/{dir}");
+                    if !remove_cpuset_dir(&path) {
+                        eprintln!("cpuset dir reclaim failed: {path}");
+                    } else {
+                        println!("cpuset dir reclaimed: {path}");
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    /// 登记进程新用到的 cpuset 目录（幂等：同目录只计一次）。
+    pub fn register_dirs(&mut self, pid: i32, dirs: &[String]) {
+        let Some(state) = self.procs.get_mut(&pid) else {
+            return;
+        };
+        for d in dirs {
+            if d.is_empty() {
+                continue;
+            }
+            if state.applied_dirs.insert(d.clone()) {
+                *self.cpuset_refs.entry(d.clone()).or_insert(0) += 1;
+            }
+        }
+    }
+
+    /// 记录已应用线程（增量检测基准）。
+    pub fn record_applied_tids(&mut self, pid: i32, tids: &HashSet<i32>) {
+        if let Some(state) = self.procs.get_mut(&pid) {
+            state.applied_tids.extend(tids.iter().copied());
+        }
+    }
+
+    /// 当前各 cpuset 目录引用数（IPC/调试用）。
+    pub fn cpuset_refs(&self) -> &HashMap<String, u32> {
+        &self.cpuset_refs
+    }
+
+    /// 清理不再被规则关注的进程（配置变更后调用）。
+    pub fn retain_interested(&mut self, pkg_set: &HashSet<String>) {
+        let stale: Vec<i32> = self
+            .procs
+            .iter()
+            .filter(|(_, p)| !pkg_set.contains(&p.pkg))
+            .map(|(&pid, _)| pid)
+            .collect();
+        for pid in stale {
+            self.remove(pid);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remove_releases_cpuset_refs() {
+        let mut tracker = StateTracker::new();
+        tracker.enter(1, "com.a".into(), 100);
+        tracker.register_dirs(1, &["0-3".into()]);
+        tracker.register_dirs(1, &["0-3".into()]); // 幂等
+        assert_eq!(tracker.cpuset_refs().get("0-3"), Some(&1));
+
+        tracker.enter(2, "com.b".into(), 100);
+        tracker.register_dirs(2, &["0-3".into()]);
+        assert_eq!(tracker.cpuset_refs().get("0-3"), Some(&2));
+
+        // 移除一个进程：引用降到 1，目录不回收
+        tracker.remove(1);
+        assert_eq!(tracker.cpuset_refs().get("0-3"), Some(&1));
+
+        // 移除最后一个：目录引用归零，从 map 移除（rmdir 在 termux 测试环境会失败，忽略）
+        tracker.remove(2);
+        assert!(tracker.cpuset_refs().get("0-3").is_none());
+    }
+
+    #[test]
+    fn retain_interested_drops_unwatched() {
+        let mut tracker = StateTracker::new();
+        tracker.enter(1, "com.a".into(), 0);
+        tracker.enter(2, "com.b".into(), 0);
+        let mut keep = HashSet::new();
+        keep.insert("com.a".to_string());
+        tracker.retain_interested(&keep);
+        assert!(tracker.contains(1));
+        assert!(!tracker.contains(2));
+    }
+
+    #[test]
+    fn thread_name_cache_clears_on_exec() {
+        let mut cache = ThreadNameCache::new(100);
+        cache.names.insert(1, "x".into());
+        cache.clear();
+        assert!(cache.names.is_empty());
+    }
+}

@@ -1,0 +1,13 @@
+[package]
+name = "threadctl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "threadctl"
+path = "src/main.rs"
+
+[dependencies]
+threadctl-core = { path = "../core" }
+libc = "0.2"

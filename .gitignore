@@ -1,0 +1,22 @@
+# Build artifacts
+/target
+**/target
+
+# Runtime
+run/
+*.pid
+*.sock
+
+# Cache / local
+.cache/
+*.zip
+*.bak
+*~
+
+# Editor
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store

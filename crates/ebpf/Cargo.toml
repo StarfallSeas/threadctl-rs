@@ -1,0 +1,12 @@
+[package]
+name = "threadctl-ebpf"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "threadctl-ebpf"
+path = "src/main.rs"
+
+[dependencies]
+aya-ebpf = "0.1"

@@ -1,0 +1,56 @@
+// ═══════════════════════════════════════════════════════════════
+//  threadctl 用户模式配置 —— 改包名即用
+// ═══════════════════════════════════════════════════════════════
+//
+// 用法：把下面的 app 行复制一份，改成你的应用包名即可。
+// 不需要懂 KDL 语法，不需要知道 CPU 集群名。
+//
+// 内置 profile（一条指令，已调好）：
+//   game       游戏：渲染上最强核+保频，音频保流畅，其余性能核
+//   chat       聊天/IM：渲染流畅，音频清晰，其余性能核
+//   video      视频：渲染/解码流畅，音频保流畅，其余省电
+//   launcher   桌面/启动器：响应快
+//   audio      音乐/播客：音频线程保流畅，其余省电
+//   balanced   均衡：全部性能核
+//   power-save 省电：全部能效核
+//
+// 高级字段（不写也能用，profile 已内置）：
+//   cpus "0-6"          指定 CPU 范围（数字范围）
+//   cluster "big"       集群名（little/big/prime）
+//   sched "fifo"        调度策略 + priority 60 = 实时优先级
+//   nice -10            进程优先级提升
+//
+// ───────────────────────────────────────────────────────────────
+
+// ============ 示例：一条指令 ============
+
+// 游戏
+app "com.miHoYo.Yuanshen" { profile "game" }
+app "com.tencent.tmgp.sgame" { profile "game" }
+
+// 聊天
+app "com.tencent.mm" { profile "chat" }
+app "com.tencent.mobileqq" { profile "chat" }
+
+// 桌面
+app "com.miui.home" { profile "launcher" }
+
+// 音乐
+app "com.netease.cloudmusic" { profile "audio" }
+
+// ============ 示例：一条指令 + 微调 ============
+// 游戏 + 额外指定某个线程上最强核：
+// app "com.example.game" {
+//     profile "game"
+//     thread "GLThread" { cluster "prime"; sched "fifo"; priority 60 }
+// }
+
+// ============ 完全手动（不需要 profile） ============
+// app "com.example.app" {
+//     default { cpus "3-6" }          // 所有线程默认 3-6 核
+//     thread "RenderThread" { cpus "7"; sched "fifo"; priority 60 }  // 渲染线程锁最强核
+// }
+
+// 注意：
+// - cluster 也可以直接写数字范围（自动识别）：cluster "0-6" 等价于 cpus "0-6"
+// - 线程名超过 15 字符会被系统截断，用 `thread-type` 或看启动日志的警告提示

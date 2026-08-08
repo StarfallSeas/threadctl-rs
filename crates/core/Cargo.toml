@@ -1,0 +1,15 @@
+[package]
+name = "threadctl-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+kdl = { version = "6", optional = true }
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+[features]
+default = ["kdl"]
+kdl-v2 = ["kdl"]
