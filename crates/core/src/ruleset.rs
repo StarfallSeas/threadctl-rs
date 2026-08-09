@@ -407,7 +407,7 @@ impl RuleSet {
     }
 }
 
-/// POSIX fnmatch 封装（与 既有实现 相同语义）。
+/// POSIX fnmatch 封装。
 pub fn fnmatch_c(pattern: &CString, string: &str) -> bool {
     const BUF_LEN: usize = MAX_THREAD_LEN;
     if string.len() >= BUF_LEN {

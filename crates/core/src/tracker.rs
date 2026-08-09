@@ -1,6 +1,6 @@
 //! StateTracker — process/thread state tracking (Q5 thread-name cache + Q3 cpuset refcounts).
 //!
-//! Replaces 既有实现's scattered `process_cache` / `ProcCache` / global 60s cache cleanup:
+//! Replaces scattered process_cache / global 60s cache cleanup:
 //! - Thread-name cache is **per-process** (TTL 60s, timers naturally stagger, no global
 //!   cleanup spike); exec invalidates it actively, process exit clears it
 //! - cpuset dir refcounts: `dir_name → refcount`, zero triggers `remove_cpuset_dir`

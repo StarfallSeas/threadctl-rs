@@ -137,7 +137,7 @@ impl EbpfSource {
         })
     }
 
-    /// 白名单键：包名前 8 / 末 8 字节（既有实现 同款——comm 15 字符裁剪，
+    /// 白名单键：包名前 8 / 末 8 字节（8 字节滑动窗口——comm 15 字符裁剪，
     /// 滑动窗口匹配需要 8 字节子串；精确匹配在用户态 read_cmdline）。
     fn target_entries(pkgs: &[String]) -> Vec<[u8; 8]> {
         let mut entries: Vec<[u8; 8]> = Vec::new();

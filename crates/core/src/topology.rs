@@ -1,4 +1,4 @@
-//! CPU bitmap & topology — migrated from 既有实现's cpuset.rs with full semantics preserved.
+//! CPU bitmap & topology — full cpuset semantics.
 
 use std::ffi::CString;
 use std::fmt::Write as _;

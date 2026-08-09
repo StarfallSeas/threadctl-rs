@@ -5,7 +5,7 @@
 //! threadctl-ebpf — 内核态事件源（P7.1）
 //!
 //! tracepoint：sched_process_fork / sched_process_exec / sched_process_exit
-//!   - FORK/EXEC：白名单粗过滤（TARGET_COMM_MAP 8 字节滑动窗口，参考 既有实现）
+//!   - FORK/EXEC：白名单粗过滤（TARGET_COMM_MAP 8 字节滑动窗口）
 //!     + 防抖（DEDUP_MAP，0.1s 窗口每 pid 最多 2 事件）
 //!   - EXIT：全量上报（线程退出 comm 不匹配包名键——过滤会漏线程退出，
 //!     IMPL-4 需要所有退出事件供用户态清理 applied_tids）
@@ -63,7 +63,7 @@ const DEDUP_MAX_COUNT: u32 = 2;
 #[map]
 static TARGET_COMM_MAP: HashMap<[u8; 8], u32> = HashMap::with_max_entries(MAP_CAPACITY, 0);
 
-/// FORK/EXEC 防抖表（高频 fork 风暴抑制，参考 既有实现）。
+/// FORK/EXEC 防抖表（高频 fork 风暴抑制）。
 #[map]
 static DEDUP_MAP: LruHashMap<u32, DedupEntry> = LruHashMap::with_max_entries(DEDUP_CAPACITY, 0);
 
@@ -105,7 +105,7 @@ fn should_dedup(pid: u32, now_ns: u64) -> bool {
     false
 }
 
-/// 白名单粗过滤：comm 任意 8 字节子串命中即通过（既有实现 同模式）。
+/// 白名单粗过滤：comm 任意 8 字节子串命中即通过（滑动窗口命中模式）。
 /// comm 是 15 字符裁剪近似（如抖音主进程 "droid.ugc.aweme"），
 /// 精确匹配永远在用户态 read_cmdline——粗过滤只为减少无关事件。
 #[inline(always)]

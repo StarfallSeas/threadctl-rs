@@ -5,7 +5,7 @@
 //! - `spawn_hot_reload`: inotify-first, poll-fallback detection thread that
 //!   broadcasts each new version over a channel (one u64 per reload)
 //!
-//! Degradation chain (migrated from 既有实现, proven):
+//! Degradation chain (proven pattern):
 //!   inotify init failure → polling; watch death (DELETE/MOVE_SELF) → reinstall → failure → polling.
 
 use std::ffi::CString;

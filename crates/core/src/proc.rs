@@ -1,4 +1,4 @@
-//! /proc read utilities — migrated from 既有实现 apply_affinity.rs (stack-allocated path buffers).
+//! /proc read utilities — stack-allocated path buffers.
 
 use std::fs;
 use std::io::Write as _;

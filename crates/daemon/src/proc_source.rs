@@ -1,6 +1,6 @@
 //! ProcSource — /proc event source (`EventSource` implementation).
 //!
-//! Discovery strategy (evolution of 既有实现 proc_mode):
+//! Discovery strategy (evolution of earlier proc-mode design):
 //! - process count change → full scan (new whitelisted process discovery → Fork events)
 //! - stable process count → incremental path: only check tracked processes
 //!   (alive + thread delta → ThreadClone)
