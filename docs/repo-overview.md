@@ -1,7 +1,7 @@
 # threadctl-rs — Repository Structure Overview
 
 > Generated: 2026-08-08 · For design review input
-> Repo: github.com/StarfallSeas/threadctl-rs · v2.0.0-dev · 60 unit tests · ~5100 lines of Rust
+> Repo: github.com/StarfallSeas/threadctl-rs · v2.0.0-dev · 73 unit tests · ~5500 lines of Rust
 
 ---
 
@@ -90,7 +90,7 @@ core 不依赖 aya / tracing——纯 syscall + 纯逻辑，这是单测友好�
 
 | 模块 | 行数 | 职责 | 关键 API |
 |---|---|---|---|
-| `topology.rs` | 384 | CPU 拓扑 | `CpuSet`（1024 位图，与 cpu_set_t 布局一致）；`CpuTopology{present,online,clusters,cpuset_enabled}`；`detect_clusters()`（cpu_capacity → Little/Big/Prime）；`read_allowed_mask()`；cpuset 目录创建/回收 |
+| `topology.rs` | ~637 | CPU 拓扑 | `CpuSet`（1024 位图，与 cpu_set_t 布局一致）；`CpuTopology{present,online,clusters,dvfs_domains,cpuset_enabled}`；`detect_clusters()`（cpu_capacity → classify_clusters：Little/Mid/Big/Prime，3 组/4 组/全大核 2 组自动）；`detect_dvfs_domains()`（cpufreq policyN，related_cpus 优先/affected_cpus fallback）；`read_allowed_mask()`；cpuset 目录创建/回收 |
 | `proc.rs` | 111 | /proc 工具 | `read_cmdline`（栈上缓冲）；`read_thread_name`；`read_start_time`（PID 复用检测）；`read_oom_adj`；`list_tids` |
 | `caps.rs` | 61 | 权限检查 | `can_rt_sched()`（euid==0 短路或 capget CAP_SYS_NICE） |
 | `lib.rs` | 34 | crate 门面 | compile_error 防护（非 Linux/Android、32 位）；模块导出 |

@@ -247,6 +247,20 @@ pub enum CpuClusterKind {
     Unknown, // 同构/无法识别
 }
 
+impl CpuClusterKind {
+    /// 配置名（CLAUDE NEW-L2）：显式名称方法，避免 config.rs 依赖
+    /// Debug 派生的格式（`{:?}` 实现若变体改名/手写会静默失效）。
+    pub fn config_name(&self) -> &'static str {
+        match self {
+            Self::Prime => "prime",
+            Self::Big => "big",
+            Self::Mid => "mid",
+            Self::Little => "little",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 /// 全大核判定阈值（CLAUDE P6.3-规划-1：双条件"且"，防新一代高效小核误判）：
 /// 2 组容量时，容量比 < 2.0 **且** 最低组容量 > 300 → Big+Prime（全大核）；
 /// 否则 Little+Big（传统 big.LITTLE）。
@@ -560,6 +574,19 @@ mod tests {
         let groups = vec![
             (300, vec![0, 1, 2, 3]),
             (500, vec![4, 5, 6, 7]),
+        ];
+        assert_eq!(names(&classify_clusters(&groups)), vec!["little", "big"]);
+
+        // CLAUDE NEW-L1：AND 半条件测试——ratio ✓ 但 min_cap ✗ → 不算全大核
+        let groups = vec![
+            (250, vec![0, 1, 2, 3]),
+            (400, vec![4, 5, 6, 7]),
+        ];
+        assert_eq!(names(&classify_clusters(&groups)), vec!["little", "big"]);
+        // AND 半条件：min_cap ✓ 但 ratio ✗ → 不算全大核
+        let groups = vec![
+            (400, vec![0, 1, 2, 3]),
+            (1000, vec![4, 5, 6, 7]),
         ];
         assert_eq!(names(&classify_clusters(&groups)), vec!["little", "big"]);
     }

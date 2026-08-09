@@ -516,7 +516,7 @@ fn policy_to_rules(pkg: &str, thread: &str, pol: &PolicyModel, clusters: &[crate
             );
             let found = clusters
                 .iter()
-                .find(|c| format!("{:?}", c.kind).to_lowercase() == cluster_name.to_lowercase())
+                .find(|c| c.kind.config_name() == cluster_name.to_lowercase())
                 .map(|c| c.cpus.to_range_string())
                 .or_else(|| {
                     if is_valid_name {
@@ -553,7 +553,7 @@ fn policy_to_rules(pkg: &str, thread: &str, pol: &PolicyModel, clusters: &[crate
                 // 告警而非静默丢弃：cluster 名写错（如 "0-6"）导致规则不生效是隐形 bug
                 let valid: Vec<String> = clusters
                     .iter()
-                    .map(|c| format!("{:?}", c.kind).to_lowercase())
+                    .map(|c| c.kind.config_name().to_string())
                     .collect();
                 eprintln!(
                     "warning: app \"{pkg}\"{} cluster \"{cluster_name}\" invalid (available: {}) — rule skipped; use cpus or a valid cluster name",
