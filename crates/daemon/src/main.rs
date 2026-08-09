@@ -150,7 +150,9 @@ fn main() {
     let _ = &decision_engine; // P6 深度接入策略决策，当前初始化并保留
 
     let tracker = Arc::new(Mutex::new(StateTracker::new()));
-    let mut source = ProcSource::new(tracker.clone());
+    // P7.1（ARCH-1）：事件源走 trait 对象注入——ProcSource（/proc 轮询）为默认，
+    // EbpfSource（内核事件驱动）就绪后在此按降级链选择（BTF/加载失败 → proc）。
+    let mut source: Box<dyn EventSource> = Box::new(ProcSource::new(tracker.clone()));
     source.on_config_changed(&cfg);
 
     let reload_rx = spawn_hot_reload(store.clone(), scan_interval.max(cfg.engine.scan_interval));
