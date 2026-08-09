@@ -2,16 +2,11 @@
 
 use std::collections::HashSet;
 use std::fs;
-use std::io::Write as _;
 use std::sync::{LazyLock, Mutex};
 
 use crate::audit::{self, AuditEntry};
 use crate::backend::{AffinityOps, CpusetOps, LinuxV1Backend, SchedulerOps};
 use crate::topology::{CpuSet, CpuTopology, BASE_CPUSET};
-
-/// 已确保存在的 cpuset 子目录缓存。
-static ENSURED_CPUSET_DIRS: LazyLock<Mutex<HashSet<String>>> =
-    LazyLock::new(|| Mutex::new(HashSet::new()));
 
 /// EINVAL 去重：同一 tid 只告警一次（内核线程/受限线程的预期行为）。
 static WARNED_EINVAL_TIDS: LazyLock<Mutex<HashSet<i32>>> =
@@ -51,10 +46,9 @@ pub fn short_circuit_total() -> u64 {
 
 /// 目录被 rmdir 回收后同步清除 ensure 缓存（Claude Q3：否则下次
 /// ensure 被缓存跳过 → cpuset tasks 写入失败）。tracker 回收目录时调用。
+/// CLAUDE NEW-M3：缓存归 LinuxV1Backend 所有，此处转发（消除反向依赖）。
 pub(crate) fn forget_cpuset_dir(dir_name: &str) {
-    if let Ok(mut guard) = ENSURED_CPUSET_DIRS.lock() {
-        guard.remove(dir_name);
-    }
+    crate::backend::forget_cpuset_dir(dir_name);
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -169,26 +163,22 @@ pub fn apply_thread(
 /// uclamp 能力缓存（ChatGPT V2：apply_uclamp 必须 capability 门控，
 /// 不支持的内核不反复 syscall 失败）。探测一次：/proc/sys/kernel/
 /// sched_util_clamp_max 存在且 > 0（与 capability.rs 同源）。
-static UCLAMP_SUPPORTED: LazyLock<std::sync::atomic::AtomicBool> =
-    LazyLock::new(|| std::sync::atomic::AtomicBool::new(false));
-static UCLAMP_CHECKED: LazyLock<std::sync::atomic::AtomicBool> =
-    LazyLock::new(|| std::sync::atomic::AtomicBool::new(false));
+/// CLAUDE NEW-L2：OnceLock 替代双 AtomicBool（Relaxed 排序下
+/// CHECKED/SUPPORTED 可能被重排；当前单线程无碍，P4 --parallel 会是真 race）。
+static UCLAMP_SUPPORT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
 fn uclamp_supported() -> bool {
-    use std::sync::atomic::Ordering;
-    if !UCLAMP_CHECKED.load(Ordering::Relaxed) {
+    *UCLAMP_SUPPORT.get_or_init(|| {
         let supported = fs::read_to_string("/proc/sys/kernel/sched_util_clamp_max")
             .ok()
             .and_then(|v| v.trim().parse::<u32>().ok())
             .map(|max| max > 0)
             .unwrap_or(false);
-        UCLAMP_SUPPORTED.store(supported, Ordering::Relaxed);
-        UCLAMP_CHECKED.store(true, Ordering::Relaxed);
         if !supported {
             eprintln!("warning: uclamp unsupported (kernel lacks CONFIG_UCLAMP_TASK); uclamp fields will be ignored");
         }
-    }
-    UCLAMP_SUPPORTED.load(Ordering::Relaxed)
+        supported
+    })
 }
 
 /// uclamp 应用：通过 backend（sched_setattr SCHED_FLAG_UTIL_CLAMP）。
@@ -260,16 +250,14 @@ fn apply_affinity(tid: i32, pkg: &str, policy: &Policy, topo: &CpuTopology, back
         } else {
             format!("{BASE_CPUSET}/{cpuset_dir}/tasks")
         };
-        if let Err(e) = fs::OpenOptions::new()
-            .append(true)
-            .open(&tasks)
-            .and_then(|mut f| f.write_all(format!("{tid}\n").as_bytes()))
-        {
+        if let Err(e) = backend.attach_task(tid, cpuset_dir) {
             // Diagnostic visibility: join failure is the #1 cause of no_intersection.
             // Full control relies on the cpuset channel; failures must be discoverable.
+            // CLAUDE NEW-M3/Q5：attach_task 现在返回错误（不再静默吞掉），
+            // 此处保留 warn_once + audit 错误处理。
             if warn_once(&WARNED_CPUSET_TIDS, tid) {
                 eprintln!(
-                    "warning: cpuset join failed tid={tid} ({tasks}): {e} \u{2014} affinity may still be restricted by Android cgroup"
+                    "warning: cpuset join failed tid={tid} dir={cpuset_dir} ({tasks}): {e} \u{2014} affinity may still be restricted by Android cgroup"
                 );
             }
             audit::record(AuditEntry {
@@ -456,20 +444,15 @@ fn apply_sched(
             });
         }
     }
-    let ret_result: Result<(), i32> = ret.map(|_| ());
-    let ret = match ret_result {
-        Ok(()) => 0,
-        Err(e) => e,
-    };
-
-    if ret != 0 {
-        let errno = Some(ret);
-        if errno == Some(libc::ESRCH) {
+    if let Err(errno) = ret {
+        // CLAUDE NEW-M2：清理 no-op 中间变量（ret.map(|_|()) 与直接 match 等价，
+        // set_scheduler 已返回 Result<(), i32>，直接 if let 解构）。
+        if errno == libc::ESRCH {
             return Some(ApplyOutcome::Exited);
         }
         if warn_once(&WARNED_EPERM_TIDS, tid) {
             eprintln!(
-                "warning: sched_setscheduler(tid={tid}) failed errno={errno:?} (RT needs root/CAP_SYS_NICE)"
+                "warning: sched_setscheduler(tid={tid}) failed errno={errno} (RT needs root/CAP_SYS_NICE)"
             );
         }
         audit::record(AuditEntry {
