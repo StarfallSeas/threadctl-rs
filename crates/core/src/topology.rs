@@ -239,8 +239,68 @@ pub fn remove_cpuset_dir(path: &str) -> bool {
 pub enum CpuClusterKind {
     Prime,   // 最高容量单核
     Big,     // 性能核
+    /// P6.3 M1：中核档（4 组容量 SoC，如 SM8650 的 A720@3.0GHz）
+    Mid,
     Little,  // 能效核
     Unknown, // 同构/无法识别
+}
+
+/// 全大核判定阈值（CLAUDE P6.3-规划-1：双条件"且"，防新一代高效小核误判）：
+/// 2 组容量时，容量比 < 2.0 **且** 最低组容量 > 300 → Big+Prime（全大核）；
+/// 否则 Little+Big（传统 big.LITTLE）。
+const ALL_BIG_MAX_RATIO: f64 = 2.0;
+const ALL_BIG_MIN_CAPACITY: u32 = 300;
+
+/// 按容量组分类（纯函数，单测友好）——detect_clusters 读 sysfs 后调用。
+///
+/// 输入：容量组升序（每组 (capacity, cpu 列表)）
+/// 输出：每组对应的 cluster kind
+///
+/// ```text
+/// N=1 → Unknown
+/// N=2 → 全大核判定（容量比 < 2.0 且 最低组 > 300）→ Big+Prime；否则 Little+Big
+/// N=3 → Little / Big / Prime（SM8475/SM8550 等）
+/// N=4 → Little / Mid / Big / Prime（SM8650）
+/// N≥5 → Little / Mid / Big×k / Prime（中间组：第一中间=Mid，其余=Big）
+/// ```
+pub(crate) fn classify_clusters(groups: &[(u32, Vec<usize>)]) -> Vec<CpuClusterKind> {
+    let n = groups.len();
+    match n {
+        0 => Vec::new(),
+        1 => vec![CpuClusterKind::Unknown],
+        2 => {
+            let min_cap = groups[0].0;
+            let max_cap = groups[1].0;
+            let ratio = if min_cap > 0 {
+                max_cap as f64 / min_cap as f64
+            } else {
+                f64::MAX
+            };
+            if ratio < ALL_BIG_MAX_RATIO && min_cap > ALL_BIG_MIN_CAPACITY {
+                // 全大核（SM8750/SM8850：Oryon 2+6，无小核）
+                vec![CpuClusterKind::Big, CpuClusterKind::Prime]
+            } else {
+                // 传统 big.LITTLE
+                vec![CpuClusterKind::Little, CpuClusterKind::Big]
+            }
+        }
+        _ => {
+            let mut kinds = Vec::with_capacity(n);
+            for i in 0..n {
+                let kind = if i == 0 {
+                    CpuClusterKind::Little
+                } else if i == n - 1 {
+                    CpuClusterKind::Prime
+                } else if n >= 4 && i == 1 {
+                    CpuClusterKind::Mid
+                } else {
+                    CpuClusterKind::Big
+                };
+                kinds.push(kind);
+            }
+            kinds
+        }
+    }
 }
 
 /// 自动检测到的 CPU 集群。
@@ -287,19 +347,18 @@ pub fn detect_clusters() -> Vec<CpuCluster> {
         }];
     }
 
-    let num_groups = capacity_groups.len();
-    let mut clusters: Vec<CpuCluster> = Vec::with_capacity(num_groups);
+    // P6.3 M1：分组逻辑提取为纯函数 classify_clusters（可单测），
+    // 此处只负责把 sysfs 容量组转成 (capacity, cpus) 切片再调用。
+    let groups: Vec<(u32, Vec<usize>)> = capacity_groups
+        .iter()
+        .map(|(&cap, cpus)| (cap, cpus.clone()))
+        .collect();
+    let kinds = classify_clusters(&groups);
 
     // BTreeMap 按容量升序，最后一项是最大容量
+    let mut clusters: Vec<CpuCluster> = Vec::with_capacity(groups.len());
     for (idx, (&capacity, cpu_list)) in capacity_groups.iter().enumerate() {
-        let kind = match (num_groups, idx) {
-            (1, _) => CpuClusterKind::Unknown,
-            (2, 0) => CpuClusterKind::Little,
-            (2, 1) => CpuClusterKind::Big,
-            (_n, i) if i == _n - 1 => CpuClusterKind::Prime,  // 最高容量 → prime
-            (_n, i) if i == 0 => CpuClusterKind::Little,
-            _ => CpuClusterKind::Big, // 中间组
-        };
+        let kind = kinds[idx].clone();
 
         let mut cpus = CpuSet::new();
         for &cpu in cpu_list {
@@ -381,4 +440,112 @@ pub fn init_cpu_topo() -> CpuTopology {
         topo.mems_str = "0".into();
     }
     topo
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn kind_name(k: &CpuClusterKind) -> &'static str {
+        match k {
+            CpuClusterKind::Prime => "prime",
+            CpuClusterKind::Big => "big",
+            CpuClusterKind::Mid => "mid",
+            CpuClusterKind::Little => "little",
+            CpuClusterKind::Unknown => "unknown",
+        }
+    }
+
+    fn names(kinds: &[CpuClusterKind]) -> Vec<&'static str> {
+        kinds.iter().map(kind_name).collect()
+    }
+
+    #[test]
+    fn classify_three_groups_unchanged() {
+        // SM8550/SM8475 回归：3 组 → Little/Big/Prime（现有语义不变）
+        let groups = vec![
+            (280, vec![0, 1, 2]),   // A510/A520 little
+            (855, vec![3, 4, 5, 6]), // A715/A710 big
+            (1024, vec![7]),        // X3/X2 prime
+        ];
+        assert_eq!(names(&classify_clusters(&groups)), vec!["little", "big", "prime"]);
+    }
+
+    #[test]
+    fn classify_four_groups_sm8650() {
+        // SM8650：4 组 → Little/Mid/Big/Prime（P6.3 M1 核心）
+        let groups = vec![
+            (240, vec![0, 1]),    // A520 little
+            (560, vec![2, 3]),    // A720@3.0 mid
+            (720, vec![4, 5, 6]), // A720@3.2 big
+            (1024, vec![7]),      // X4 prime
+        ];
+        assert_eq!(names(&classify_clusters(&groups)), vec!["little", "mid", "big", "prime"]);
+    }
+
+    #[test]
+    fn classify_two_groups_all_big_sm8750() {
+        // SM8750/SM8850：2 组全大核（容量比 < 2.0 且 最低组 > 300）→ Big/Prime
+        let groups = vec![
+            (700, vec![0, 1, 2, 3, 4, 5]), // Oryon@3.53GHz
+            (900, vec![6, 7]),             // Oryon@4.32GHz
+        ];
+        assert_eq!(names(&classify_clusters(&groups)), vec!["big", "prime"]);
+    }
+
+    #[test]
+    fn classify_two_groups_big_little() {
+        // 传统 big.LITTLE：容量比 > 2.0 → Little/Big
+        let groups = vec![
+            (280, vec![0, 1, 2]),
+            (855, vec![3, 4, 5, 6]),
+        ];
+        assert_eq!(names(&classify_clusters(&groups)), vec!["little", "big"]);
+    }
+
+    #[test]
+    fn classify_two_groups_ratio_boundary() {
+        // 边界：容量比恰好 2.0 → 不算全大核（< 是严格小于）
+        let groups = vec![
+            (400, vec![0, 1, 2, 3]),
+            (800, vec![4, 5, 6, 7]),
+        ];
+        assert_eq!(names(&classify_clusters(&groups)), vec!["little", "big"]);
+
+        // 边界：最低组恰好 300 → 不算全大核（> 是严格大于）
+        let groups = vec![
+            (300, vec![0, 1, 2, 3]),
+            (500, vec![4, 5, 6, 7]),
+        ];
+        assert_eq!(names(&classify_clusters(&groups)), vec!["little", "big"]);
+    }
+
+    #[test]
+    fn classify_five_groups_generic() {
+        // N≥5：Little/Mid/Big×k/Prime（第一中间=Mid，其余=Big）
+        let groups = vec![
+            (200, vec![0, 1]),
+            (400, vec![2]),
+            (600, vec![3, 4]),
+            (800, vec![5, 6]),
+            (1024, vec![7]),
+        ];
+        assert_eq!(names(&classify_clusters(&groups)), vec!["little", "mid", "big", "big", "prime"]);
+    }
+
+    #[test]
+    fn classify_one_group_unknown() {
+        // 同构 SoC → Unknown
+        let groups = vec![(800, vec![0, 1, 2, 3, 4, 5, 6, 7])];
+        assert_eq!(names(&classify_clusters(&groups)), vec!["unknown"]);
+    }
+
+    #[test]
+    fn cpu_set_parse_roundtrip() {
+        // 范围字符串解析 → to_range_string 往返
+        let s = "0-3,6-7";
+        let set = parse_cpu_ranges(s, None);
+        assert_eq!(set.to_range_string(), s);
+        assert_eq!(set.count(), 6);
+    }
 }
