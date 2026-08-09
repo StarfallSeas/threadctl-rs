@@ -30,11 +30,30 @@ with DeepSeek's design docs and responses/adoptions in `docs/DeepSeek/`.
 
 ```
 P0 workspace → P1 ConfigStore → P2 proc pipeline → P5 five modules
-→ P6.0 Profile → P6.1 Matcher (frozen) → P6.2 Policy Merge Engine (in progress)
+→ P6.0 Profile → P6.1 Matcher (frozen) → P6.2 Policy Merge Engine (frozen)
+→ P6.3 SoC adaptation (frozen) → P7 eBPF/adaptive-relock/IPC (planning)
 ```
 
 Each phase: implement → write delivery doc → peer review by the other two AIs
 → fix → regression → freeze → boss inspects the final effect.
+
+## 大版本三审制（P7 起，废除 Px.x 细分）
+
+> **每个大版本更新前，三个 AI 都要审计，意见一致才能开始构建（代码）。**
+
+```
+1. DeepSeek 撰写下一个大版本文档（规划书 v1）
+2. ChatGPT 审 DeepSeek 文档（架构/文档方向）
+3. Claude 审 ChatGPT 文档 + DeepSeek 文档 + 代码（架构缺口/实现细节）
+4. DeepSeek 综合裁决：一致意见必采纳；分歧由执行者定夺（boss 可异议）
+5. 裁决后定稿（规划书 v2）→ 三 AI 意见一致 → 开始构建
+6. 构建按里程碑（P7.1/P7.2/...）交付，每里程碑独立审
+```
+
+审查文档归档：
+- `docs/DeepSeek/P7-plan.md`（规划书 v1→v2 定稿，含"审查裁决"节）
+- `docs/ChatGPT/P7-plan.md`（ChatGPT 审）
+- `docs/Claude/P7-plan.md`（Claude 审，含对 ChatGPT 意见的评价）
 
 ## Notable corrections from review
 
