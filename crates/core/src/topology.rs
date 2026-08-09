@@ -237,7 +237,7 @@ pub fn remove_cpuset_dir(path: &str) -> bool {
 // ── CPU 集群检测 ──────────────────────────────────────────────
 
 /// 集群类别。
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum CpuClusterKind {
     Prime,   // 最高容量单核
     Big,     // 性能核

@@ -1,4 +1,4 @@
-// threadctl-rs — KDL 配置示例（修正版：cluster vs cpus 用法）
+// threadctl-rs — KDL 配置示例（P6.3：cluster 支持 mid + 同档 fallback）
 //
 // 使用方法：
 //   ./threadctl -c threadctl.kdl
@@ -6,10 +6,16 @@
 // 语法说明：
 //   - 字符串用双引号 "..."；// 单行注释
 //   - default / thread / thread-type 内可设：cpus、cluster、sched、priority、nice、uclamp-min、uclamp-max
-//   - cluster 自动从 cpu_capacity 检测：little / big / prime —— 只接受这三个名字！
-//   - cpus 接受数字范围："0-6"、"7"、"4-7" —— 想指定具体 CPU 用 cpus，不要写 cluster "0-6"
+//   - cluster 自动从 cpu_capacity 检测：little / mid / big / prime
+//     · SM8550/SM8475（3 组）：little / big / prime（无 mid）
+//     · SM8650（4 组）：little / mid / big / prime
+//     · SM8750/SM8850（2 组全大核）：big / prime（无 little/mid）
+//   - cluster 设备上不存在时 → 同档近似 fallback + 告警（不静默）：
+//     little/mid → big；big/prime → prime
+//   - cpus 接受数字范围："0-6"、"7"、"4-7" —— 想指定具体 CPU 用 cpus
 //   - thread-type 内置别名：render→*RenderThread*,*GL*,*Vk*；audio→*Audio*,*Sound*；binder→*Binder:*；main→*main*
 //   - priority 配合 sched fifo/rr，自动合并为 "fifo:60"
+//   - 本仓库不内置默认规则——以下均为示例，按需复制进自己的配置
 
 // ────────────────────────────── 守护进程 ──────────────────────────────
 daemon {
@@ -30,7 +36,7 @@ engine {
 
 // ────────────────────────────── APP 规则 ──────────────────────────────
 
-// ============ 微信 ============
+// ============ 微信（示例模板） ============
 // app "com.tencent.mm" {
     // 默认：所有未单独命名的线程放 big 集群
     // default {
@@ -67,6 +73,20 @@ app "com.miHoYo.Yuanshen" {
     }
 }
 
+// ============ 抖音（P6.3 示例：cpus 直达，防 AMS/自研线程管理干扰） ============
+// app "com.ss.android.ugc.aweme" {
+    // default {
+        // cpus "0-7"
+    // }
+    // thread "RenderThread" {
+        // cpus "3-7"
+        // sched "fifo"
+        // priority 60
+        // nice -10
+    // }
+    // 注意：抖音部分版本会自行重设线程亲和性，与外部策略对抗属正常现象
+// }
+
 // ============ 酷安 ============
 app "com.coolapk.market" {
     default {
@@ -81,8 +101,7 @@ app "com.coolapk.market" {
 }
 
 // ============ 系统桌面 ============
-// 注意：cluster 字段只接受 little/big/prime；
-// 指定具体 CPU 范围必须用 cpus（cluster "0-6" 是无效写法，会被告警并跳过）
+// 指定具体 CPU 范围用 cpus（比 cluster 更精确）
 app "com.miui.home" {
     default {
         cpus "0-6"
@@ -114,6 +133,15 @@ app "com.netease.cloudmusic" {
     }
 }
 
+// ============ SM8650（骁龙 8 Gen 3，4 组）mid 示例 ============
+// 仅 4 组容量 SoC 存在 mid 集群；其他 SoC 上 cluster "mid" → fallback big + 告警
+// app "com.example.sm8650app" {
+    // 中核（A720@3.0GHz，2-3 号 CPU）适合轻量前台线程：省电且响应不差
+    // thread "BgThread" {
+        // cluster "mid"
+    // }
+// }
+
 // ============ 通用游戏示例（用 CPU 范围直达） ============
 // app "com.example.game" {
     // 也可以不写 cluster，直接用 cpus 范围
@@ -124,13 +152,6 @@ app "com.netease.cloudmusic" {
         // cpus "7"
         // sched "fifo"
         // priority 60
-    // }
-// }
-
-// ============ 桌面 Linux 浏览器（big 只存在时的 fallback） ============
-// app "firefox" {
-    // default {
-        // cluster "big"
     // }
 // }
 

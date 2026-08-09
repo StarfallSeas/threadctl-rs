@@ -1,0 +1,67 @@
+// threadctl-rs — 包组模板（P6.3：不内置 group 表，按需复制）
+//
+// 使用方法：把需要的组规则复制进你的 threadctl.kdl，
+// 把 "com.example.*" 换成真实包名前缀。
+//
+// 注意：group 不是内置机制——这些是**手写通配规则模板**。
+// 通配包名规则与精确包名规则并存（exact override wildcard），
+// 低优先级来源填充高优先级未设置的字段（继承语义）。
+
+// ════════════ 社交组（均衡档） ════════════
+// 通配命中所有腾讯系社交（微信/QQ/QQ音乐等）的**未精确配置部分**
+// app "com.tencent.*" {
+    // default {
+        // cluster "big"
+    // }
+// }
+
+// ════════════ 游戏组（性能档，通配兜底） ════════════
+// 大型游戏包名前缀示例：miHoYo / levelinfinite / netease
+// app "com.miHoYo.*" {
+    // default {
+        // cluster "big"
+    // }
+// }
+// app "com.levelinfinite.*" {
+    // default {
+        // cluster "big"
+    // }
+// }
+
+// ════════════ 工具/浏览器组（省电档） ════════════
+// app "com.android.chrome" {
+    // default {
+        // cluster "little"
+    // }
+    // thread "RenderThread" {          // 渲染线程仍需流畅
+        // cluster "big"
+    // }
+// }
+
+// ════════════ 音乐组（低功耗保活档） ════════════
+// app "com.netease.*" {
+    // thread-type "audio" {
+        // cluster "big"
+        // sched "rr"
+        // priority 30
+    // }
+    // default {
+        // cluster "little"
+    // }
+// }
+
+// ════════════ 精确覆盖示例（exact > wildcard） ════════════
+// 通配组给默认，精确 app 只补线程规则——字段级继承：
+// app "com.tencent.mm" {
+    // thread "RenderThread" {
+        // cluster "prime"
+        // sched "fifo"
+        // priority 60
+    // }
+    // 其余线程自动继承 com.tencent.* 的 big 默认
+// }
+
+// ════════════ 匹配优先级提醒 ════════════
+// 同包多条通配命中时，取 specificity 最大者：
+//   com.tencent.mm*  (1404) > com.tencent.*  (1202) > com.*  (394)
+// 用户可见语义 = 最长固定前缀优先。

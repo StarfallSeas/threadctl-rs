@@ -1,0 +1,77 @@
+// threadctl-rs — 性能档位模板（P6.3：不内置默认规则，按需复制）
+//
+// 使用方法：把需要的 profile 内容复制进你的 threadctl.kdl，
+// 把 "com.example.X" 换成真实包名。
+//
+// 注意：profile 不是内置机制——这些是**手写规则模板**，
+// 复制后与普通 app 规则完全等价（RuleSource 不感知 profile 语义）。
+
+// ════════════ 游戏档位（性能优先） ════════════
+// 适用：原神/王者/崩铁等重负载游戏
+// 语义：主渲染线程锁 prime + RT，其余线程 big，后台线程 little
+// app "com.example.game" {
+    // default {
+        // cluster "big"
+    // }
+    // thread "UnityMain" {            // Unity 引擎主渲染线程
+        // cluster "prime"
+        // sched "fifo"
+        // priority 10                 // 游戏 RT 优先级低些，避免完全抢占系统
+    // }
+    // thread "RenderThread" {         // 自研引擎渲染线程
+        // cluster "prime"
+        // sched "fifo"
+        // priority 60
+    // }
+    // thread-type "render" {          // 其余渲染线程
+        // cluster "big"
+    // }
+// }
+
+// ════════════ 聊天/社交档位（均衡） ════════════
+// 适用：微信/QQ/Telegram 等
+// 语义：主线程 big 保响应，音频线程 big 保流畅，其余 little 省电
+// app "com.example.chat" {
+    // default {
+        // cluster "little"
+    // }
+    // thread "RenderThread" {
+        // cluster "big"
+    // }
+    // thread-type "audio" {
+        // cluster "big"
+        // sched "rr"
+        // priority 30
+    // }
+// }
+
+// ════════════ 视频/直播档位（流畅 + 后台感知） ════════════
+// 适用：抖音/B站/直播类
+// 语义：视频解码线程 big，播放线程 big，其余跟随系统
+// 注意：部分 APP（如抖音）自行重设线程亲和性，与外部策略对抗属正常
+// app "com.example.video" {
+    // thread-type "render" {
+        // cluster "big"
+    // }
+    // thread "VD*" {                   // 视频解码线程（抖音命名风格）
+        // cluster "big"
+    // }
+    // thread "Reade*" {                // 读取线程
+        // cluster "big"
+        // nice -5
+    // }
+// }
+
+// ════════════ 音乐/后台档位（低功耗保活） ════════════
+// 适用：网易云/Spotify/播客
+// 语义：音频线程 big + RR 保流畅，其余全部 little 省电
+// app "com.example.music" {
+    // thread-type "audio" {
+        // cluster "big"
+        // sched "rr"
+        // priority 30
+    // }
+    // default {
+        // cluster "little"
+    // }
+// }

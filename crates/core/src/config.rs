@@ -508,11 +508,11 @@ fn policy_to_rules(pkg: &str, thread: &str, pol: &PolicyModel, clusters: &[crate
         if looks_like_cpu_range(cluster_name) {
             Some(cluster_name.clone())
         } else {
-            // 集群名解析：合法名（little/big/prime）但设备无此集群时
-            // fallback 到容量最大的集群；非法名仍告警跳过。
+            // 集群名解析：合法名（little/mid/big/prime）但设备无此集群时
+            // fallback 到同档近似集群；非法名仍告警跳过。
             let is_valid_name = matches!(
                 cluster_name.to_lowercase().as_str(),
-                "little" | "big" | "prime"
+                "little" | "mid" | "big" | "prime" // LOW-3 (Claude)：加 mid
             );
             let found = clusters
                 .iter()
@@ -520,9 +520,31 @@ fn policy_to_rules(pkg: &str, thread: &str, pol: &PolicyModel, clusters: &[crate
                 .map(|c| c.cpus.to_range_string())
                 .or_else(|| {
                     if is_valid_name {
-                        clusters
-                            .last() // detect_clusters 按容量升序，最后是最大容量集群
-                            .map(|c| c.cpus.to_range_string())
+                        // CLAUDE BUG-M2：不静默取最高容量（clusters.last()——
+                        // 全大核 SoC 上 cluster "little" 会错误绑到 prime）。
+                        // fallback 同档近似 + 告警：
+                        //   little/mid 不可用 → big（低性能组）
+                        //   big/prime 不可用 → prime
+                        //   单集群 Unknown → 唯一集群（兜底）
+                        let approx = match cluster_name.to_lowercase().as_str() {
+                            "little" | "mid" => crate::topology::CpuClusterKind::Big,
+                            "big" | "prime" => crate::topology::CpuClusterKind::Prime,
+                            _ => crate::topology::CpuClusterKind::Unknown,
+                        };
+                        let approx_cluster = clusters
+                            .iter()
+                            .find(|c| c.kind == approx)
+                            .or_else(|| clusters.last());
+                        if let Some(cc) = approx_cluster {
+                            eprintln!(
+                                "warning: app \"{pkg}\"{} cluster \"{cluster_name}\" not available on this SoC — using {} cluster instead",
+                                if thread.is_empty() { String::new() } else { format!(" thread \"{thread}\"") },
+                                format!("{:?}", cc.kind).to_lowercase()
+                            );
+                            Some(cc.cpus.to_range_string())
+                        } else {
+                            None
+                        }
                     } else {
                         None
                     }
@@ -773,5 +795,80 @@ mod profile_tests {
         // 未知 profile → 空模板 → 无策略 → 占位规则
         assert_eq!(rules.len(), 1);
         assert!(rules[0].cpus.is_empty());
+    }
+
+    // ── P6.3 M3：cluster mid + BUG-M2 fallback 测试 ──
+
+    fn mk_cluster(kind: crate::topology::CpuClusterKind, cpus: &str, cap: u32) -> crate::topology::CpuCluster {
+        let set = crate::topology::parse_cpu_ranges(cpus, None);
+        crate::topology::CpuCluster {
+            kind,
+            cpus: set.clone(),
+            range_str: set.to_range_string(),
+            capacity: cap,
+        }
+    }
+
+    fn mk_pol_cluster(name: &str) -> PolicyModel {
+        PolicyModel {
+            cpus: None,
+            cluster: Some(name.into()),
+            sched: None,
+            nice: None,
+            uclamp_min: None,
+            uclamp_max: None,
+        }
+    }
+
+    #[test]
+    fn cluster_mid_resolves_on_four_group() {
+        // SM8650 4 组：cluster "mid" → 中核 2-3（P6.3 M3 核心）
+        use crate::topology::CpuClusterKind as K;
+        let clusters = vec![
+            mk_cluster(K::Little, "0-1", 240),
+            mk_cluster(K::Mid, "2-3", 560),
+            mk_cluster(K::Big, "4-6", 720),
+            mk_cluster(K::Prime, "7", 1024),
+        ];
+        let rules = policy_to_rules("com.x", "", &mk_pol_cluster("mid"), &clusters);
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].cpus, "2-3", "cluster mid 应解析为中核组");
+    }
+
+    #[test]
+    fn cluster_little_fallback_to_big_on_all_big() {
+        // CLAUDE BUG-M2：全大核 SoC（SM8750）上 cluster "little" 应 fallback
+        // 到 Big(0-5)，而非静默取最高容量 Prime(6-7)
+        use crate::topology::CpuClusterKind as K;
+        let clusters = vec![
+            mk_cluster(K::Big, "0-5", 700),
+            mk_cluster(K::Prime, "6-7", 900),
+        ];
+        let rules = policy_to_rules("com.x", "", &mk_pol_cluster("little"), &clusters);
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].cpus, "0-5", "little 不可用 → 同档近似 big");
+    }
+
+    #[test]
+    fn cluster_big_fallback_on_single_unknown() {
+        // 单集群 Unknown（同构 SoC）：cluster "big" → 唯一集群兜底
+        use crate::topology::CpuClusterKind as K;
+        let clusters = vec![mk_cluster(K::Unknown, "0-7", 800)];
+        let rules = policy_to_rules("com.x", "", &mk_pol_cluster("big"), &clusters);
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].cpus, "0-7", "单集群兜底全部 CPU");
+    }
+
+    #[test]
+    fn cluster_exact_hit_no_fallback() {
+        // 精确命中不触发 fallback（保持既有语义）
+        use crate::topology::CpuClusterKind as K;
+        let clusters = vec![
+            mk_cluster(K::Little, "0-2", 280),
+            mk_cluster(K::Big, "3-6", 855),
+            mk_cluster(K::Prime, "7", 1024),
+        ];
+        let rules = policy_to_rules("com.x", "", &mk_pol_cluster("big"), &clusters);
+        assert_eq!(rules[0].cpus, "3-6", "big 精确命中");
     }
 }

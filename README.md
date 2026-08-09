@@ -166,7 +166,8 @@ app "com.example.game" {
 }
 ```
 
-- `cluster` 接受 `little` / `big` / `prime`；**数字范围自动识别为 cpus**（`cluster "0-6"` ≡ `cpus "0-6"`）
+- `cluster` 接受 `little` / `mid` / `big` / `prime`（自动按 cpu_capacity 检测：3 组 SoC 无 mid，SM8650 有 mid，全大核 SoC 只有 big/prime）；**数字范围自动识别为 cpus**（`cluster "0-6"` ≡ `cpus "0-6"`）
+- cluster 在设备上不存在时 → **同档近似 fallback + 告警**（little/mid → big，big/prime → prime，不静默绑错核）
 - 线程名超过 15 字节会被内核截断——启动日志会给出截断警告
 
 ---

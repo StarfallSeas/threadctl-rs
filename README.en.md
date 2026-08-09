@@ -168,7 +168,8 @@ app "com.example.game" {
 }
 ```
 
-- `cluster` accepts `little` / `big` / `prime`; **numeric ranges are auto-detected as cpus** (`cluster "0-6"` ≡ `cpus "0-6"`)
+- `cluster` accepts `little` / `mid` / `big` / `prime` (auto-detected from cpu_capacity: 3-group SoCs have no mid, SM8650 has mid, all-big SoCs only big/prime); **numeric ranges are auto-detected as cpus** (`cluster "0-6"` ≡ `cpus "0-6"`)
+- A cluster missing on the device → **same-tier fallback + warning** (little/mid → big, big/prime → prime; never silently binds wrong cores)
 - Thread names longer than 15 bytes get truncated by the kernel — the daemon warns at startup
 
 ---
