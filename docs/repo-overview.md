@@ -1,7 +1,7 @@
 # threadctl-rs — Repository Structure Overview
 
 > Generated: 2026-08-08 · For design review input
-> Repo: github.com/StarfallSeas/threadctl-rs · v2.0.0 · 46 unit tests · 5084 lines of Rust
+> Repo: github.com/StarfallSeas/threadctl-rs · v2.0.0-dev · 60 unit tests · ~5100 lines of Rust
 
 ---
 
@@ -72,7 +72,7 @@ core 不依赖 aya / tracing——纯 syscall + 纯逻辑，这是单测友好�
 
 | 模块 | 行数 | 职责 | 关键类型/API |
 |---|---|---|---|
-| `policy.rs` | 367 | 内核动作 | `apply_thread(tid, pkg, &Policy, topo, rt_allowed) -> ApplyOutcome`；`ApplyOutcome{Applied,Exited,BlockedByCgroup,Downgraded,BlockedByPerm,EINVAL,Failed,SkippedNoCpus}`；`Policy{cpus, cpuset_dir, sched, sched_prio, nice}`；三层过滤（online→allowed 交集→setaffinity）；EPERM/EINVAL/cpuset 失败 warn_once 去重；audit 全路径记录 |
+| `policy.rs` | 367 | 内核动作 | `apply_thread(tid, pkg, &Policy, topo, rt_allowed) -> ApplyOutcome`；`ApplyOutcome{Applied,Exited,BlockedByCgroup,Downgraded,BlockedByPerm,EINVAL,Failed,SkippedNoCpus}`；`Policy{cpus, cpuset_dir, sched, sched_prio, nice, uclamp_min, uclamp_max}`；三层过滤（online→allowed 交集→setaffinity）；EPERM/EINVAL/cpuset 失败 warn_once 去重；audit 全路径记录 |
 | `engine.rs` | 288 | 事件引擎 | `handle_events(&mut StateTracker, &[ProcessEvent], cfg, topo, now)`；`relock_all`（读 oom_adj 跳过后台）；`cleanup_dead`；`tracked_summary`；`refresh_process_rules`（线程名 TTL 缓存 + fnmatch 匹配 + apply） |
 | `tracker.rs` | 254 | 进程状态 | `StateTracker`：start_time 防 PID 复用；每进程线程名缓存（TTL 60s，exec 失效）；cpuset 目录引用计数回收；`enter/get/get_mut/remove/register_dirs` |
 
@@ -135,7 +135,7 @@ app "com.miHoYo.Yuanshen" {
 engine::handle_events ──▶ StateTracker ──▶ ConfigSnapshot（新实例，缓存自然失效）
    │ ruleset.resolve(pkg, thread)
    ▼
-Policy{cpus, cpuset_dir, sched, nice}
+Policy{cpus, cpuset_dir, sched, sched_prio, nice, uclamp_min, uclamp_max}
    ▼
 policy::apply_thread（三层过滤 + cpuset 移入 + audit 记录）
    ▼

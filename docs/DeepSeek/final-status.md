@@ -3,6 +3,10 @@
 > 生成日期：2026-08-08
 > 项目：threadctl-rs v2.0.0 — Android/Linux 任务策略编排引擎（KDL→AST→Policy Compiler→RuleSet→Decision Engine→Kernel Action）
 > 状态：P0-P6.1 全部完成，44 单测全绿，零警告，release 851KB
+>
+> **⚠️ 本文档是 P6.1 阶段快照（2026-08-07）**：P6.2 新增 16 项修复后
+> 当前为 60 单测全绿 / 858KB / v2.0.0-dev。历史数字保留供阶段追溯，
+> 最新状态以 P6.2-final-delivery.md 与 README 徽章为准。
 > 本文档汇总：实现现状 / 三轮 AI 审查落地 / 最终测试矩阵 / 遗留项 / P6.2 方向
 
 ---

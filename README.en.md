@@ -28,7 +28,7 @@ Config Compiler → RuleSet → Policy Merge → Kernel Action
 
 ![license](https://img.shields.io/badge/license-GPL--3.0-blue.svg)
 ![rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)
-![tests](https://img.shields.io/badge/tests-46%20passing-green.svg)
+![tests](https://img.shields.io/badge/tests-60%20passing-green.svg)
 ![platform](https://img.shields.io/badge/platform-Linux%20%7C%20Android-lightgrey.svg)
 
 ---

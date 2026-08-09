@@ -5,6 +5,7 @@
 //! Records expected vs actual effect of every rule application, feeding back
 //! into the decision engine.
 
+use std::collections::VecDeque;
 use std::sync::{LazyLock, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -60,7 +61,9 @@ impl AuditSummary {
 }
 
 /// 全局审计缓冲（最近 N 条记录，环形）。
-static AUDIT_LOG: LazyLock<Mutex<Vec<AuditEntry>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+/// CLAUDE LOW-1：VecDeque + pop_front（O(1)），替换 Vec::remove(0)（O(n) 移位）。
+static AUDIT_LOG: LazyLock<Mutex<VecDeque<AuditEntry>>> =
+    LazyLock::new(|| Mutex::new(VecDeque::new()));
 const AUDIT_LOG_MAX: usize = 256;
 
 /// 记录一次审计（自动盖时间戳）。
@@ -71,16 +74,16 @@ pub fn record(mut entry: AuditEntry) {
     // L2 修复：poison 恢复，与 summary() 一致
     let mut log = AUDIT_LOG.lock().unwrap_or_else(|e| e.into_inner());
     if log.len() >= AUDIT_LOG_MAX {
-        log.remove(0);
+        log.pop_front();
     }
-    log.push(entry);
+    log.push_back(entry);
 }
 pub fn recent(n: usize) -> Vec<AuditEntry> {
     AUDIT_LOG
         .lock()
         .map(|log| {
-            let start = log.len().saturating_sub(n);
-            log[start..].to_vec()
+            let skip = log.len().saturating_sub(n);
+            log.iter().skip(skip).cloned().collect()
         })
         .unwrap_or_default()
 }
@@ -89,7 +92,7 @@ pub fn recent(n: usize) -> Vec<AuditEntry> {
 pub fn summary() -> AuditSummary {
     AUDIT_LOG
         .lock()
-        .map(|log| summarize(&log))
+        .map(|log| summarize(log.iter()))
         .unwrap_or_default()
 }
 
@@ -104,15 +107,16 @@ pub fn summary_windowed(window_secs: u64) -> AuditSummary {
         .map(|log| {
             let recent: Vec<AuditEntry> =
                 log.iter().filter(|e| e.timestamp >= cutoff).cloned().collect();
-            summarize(&recent)
+            summarize(recent.iter())
         })
         .unwrap_or_default()
 }
 
-fn summarize(log: &[AuditEntry]) -> AuditSummary {
+fn summarize<'a>(entries: impl Iterator<Item = &'a AuditEntry>) -> AuditSummary {
     let mut s = AuditSummary::default();
-    s.total_attempts = log.len();
-    for entry in log {
+    let entries: Vec<&AuditEntry> = entries.collect();
+    s.total_attempts = entries.len();
+    for entry in entries {
         if entry.success {
             s.success += 1;
         }

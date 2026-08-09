@@ -160,7 +160,8 @@ impl StateTracker {
                     } else {
                         // Claude Q3: rmdir 后同步清除 ensure 缓存，否则下次
                         // ensure 被缓存跳过 → cpuset tasks 写入失败
-                        crate::policy::forget_cpuset_dir(dir);
+                        // CLAUDE LOW-2：缓存归 backend，直接调（policy.rs 转发层已删）
+                        crate::backend::forget_cpuset_dir(dir);
                         println!("cpuset dir reclaimed: {path}");
                     }
                 }

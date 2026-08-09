@@ -44,13 +44,6 @@ pub fn short_circuit_total() -> u64 {
 }
 
 
-/// 目录被 rmdir 回收后同步清除 ensure 缓存（Claude Q3：否则下次
-/// ensure 被缓存跳过 → cpuset tasks 写入失败）。tracker 回收目录时调用。
-/// CLAUDE NEW-M3：缓存归 LinuxV1Backend 所有，此处转发（消除反向依赖）。
-pub(crate) fn forget_cpuset_dir(dir_name: &str) {
-    crate::backend::forget_cpuset_dir(dir_name);
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SchedPolicy {
     Other,
@@ -330,7 +323,33 @@ fn apply_affinity(tid: i32, pkg: &str, policy: &Policy, topo: &CpuTopology, back
             }
             // NEW-M2: 交集缩减后必须补 setaffinity——否则线程 affinity 仍是宽掩码，
             // 下轮 getaffinity 短路永远无法命中，且状态与 audit 记录不符。
-            let _ = effective.set_affinity(tid);
+            // CLAUDE BUG-H1：必须经 backend（不绕过抽象），且错误不能吞——
+            // ESRCH 线程已死（不应记 applied_tids/dirs），EPERM 需可见。
+            if let Err(errno) = backend.set_affinity(tid, &effective) {
+                if errno == libc::ESRCH {
+                    audit::record(AuditEntry {
+                        timestamp: 0,
+                        tid, pkg: pkg.to_string(),
+                        requested_cpus: before,
+                        effective_cpus: after.clone(),
+                        success: false,
+                        reason: "esrch".into(),
+                    });
+                    return ApplyOutcome::Exited;
+                }
+                if warn_once(&WARNED_EPERM_TIDS, tid) {
+                    eprintln!("warning: setaffinity(tid={tid}) downgraded path EPERM (errno={errno})");
+                }
+                audit::record(AuditEntry {
+                    timestamp: 0,
+                    tid, pkg: pkg.to_string(),
+                    requested_cpus: before,
+                    effective_cpus: after.clone(),
+                    success: false,
+                    reason: "downgraded_failed".into(),
+                });
+                return ApplyOutcome::Failed;
+            }
             audit::record(AuditEntry {
                 timestamp: 0,
                 tid, pkg: pkg.to_string(),
