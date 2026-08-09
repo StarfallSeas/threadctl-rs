@@ -82,11 +82,11 @@ TP_STRUCT__entry(
 - 线程被调度到的 **CPU 编号**不直接在 tracepoint 字段中，需
   用 `bpf_get_smp_processor_id()` 获取
 - **设计中采用低频采样模式**：每进程每秒最多 1 次 CpuMigrate 事件，
-  通过 BPF `LruHashMap<pid, last_ns>` 防抖（参见 既有实现 已验证的 DEDUP_MAP）
+  通过 BPF `LruHashMap<pid, last_ns>` 防抖（DEDUP_MAP 模式）
 
 ### 1.6 sched_process_fork 的线程语义
 
-来源：既有实现 已验证行为 + 内核源码
+来源：内核源码
 
 - `sched_process_fork` 在 `clone()` / `fork()` 时触发（均在 `_do_fork` 内）
 - `pthread_create` 也走 `clone()` → **fork tracepoint 同时捕获线程创建**
@@ -174,8 +174,8 @@ TP_STRUCT__entry(
 
 **内核态**（`crates/ebpf/src/main.rs`）：
 
-- **迁移** 既有实现 的 fork tracepoint（`sched_process_fork`）+ 白名单 + 防抖 + RingBuf
-- **迁移** 既有实现 的 exec tracepoint（`sched_process_exec`）+ 白名单检查
+- **实现** fork tracepoint（`sched_process_fork`）+ 白名单 + 防抖 + RingBuf
+- **实现** exec tracepoint（`sched_process_exec`）+ 白名单检查
 - **预留** sched_switch 采样（P5）——在文件末尾以注释形式留下接口
 - 白名单 map 动态容量：ConfigStore 计算后通过 `EbpfLoader::set_max_entries` 传入
 - 防抖 map（DEDUP_MAP）：LruHashMap<pid, (last_ns, count)>，0.1s 窗口
@@ -279,7 +279,7 @@ fn detect_cpuset_path() -> Option<&'static str> {
 | `daemon/src/ipc.rs` | 新增 | Unix socket IPC 骨架 |
 | `daemon/src/daemonize.rs` | 新增 | 信号处理 + pidfile |
 | `daemon/src/main.rs` | 重写 | 装配 Orchestrator + 精简 main |
-| `crates/ebpf/src/main.rs` | 重写 | fork/exec 内核程序（既有实现 迁移）+ sched_switch 预留 |
+| `crates/ebpf/src/main.rs` | 重写 | fork/exec 内核程序 + sched_switch 预留 |
 | `crates/core/src/topology.rs` | 修改 | detect_cpuset_path + cgroup v2 检测骨架 |
 | `Cargo.toml`（daemon） | 修改 | 加 aya, signal-hook, tracing 依赖 |
 
@@ -305,7 +305,7 @@ fn detect_cpuset_path() -> Option<&'static str> {
 4. **IPC 协议安全**：Unix socket 无鉴权，任何本地进程可发送 reload/dump 命令。
    是否需要引入简单鉴权（如 fd 凭证检查 `SO_PEERCRED`，只允许 UID 0 或
    特定 GID）？还是接受"本地 IPC 即为信任边界"？
-5. **aya 版本选择**：aya 0.13。aya 目前已到 0.12+（API 可能变动）。
+5. **aya 版本选择**：锁 aya 0.13（API 可能变动）。
    确认使用哪个版本并锁定 workspace Cargo.toml。内核态程序也依赖 aya-ebpf
    匹配版本。
 

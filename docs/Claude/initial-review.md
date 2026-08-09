@@ -234,7 +234,7 @@ release LTO 后 +50KB，完全可接受。P4 引入，现在所有 eprintln! 换
 
 **Q5: aya 版本**
 
-Cargo.toml 没在本次提交里（只看到 core/daemon 的），无法确认。建议锁到 aya 0.12 或 0.13，与 既有实现 保持一致。
+Cargo.toml 没在本次提交里（只看到 core/daemon 的），无法确认。建议锁到 aya 0.12 或 0.13。
 
 ### P4 的 5 个问题
 

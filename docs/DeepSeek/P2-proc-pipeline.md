@@ -49,10 +49,10 @@ P2 实现了守护进程的第一个可运行闭环：
 
 ### 1. `proc.rs` — /proc 读取
 
-既有实现 `apply_affinity.rs` 移植，保留栈上路径缓冲设计。新增 `list_tids`（枚举 /proc/<pid>/task）。
+沿用栈上路径缓冲设计。新增 `list_tids`（枚举 /proc/<pid>/task）。
 
 **注意**：`read_proc_file` 用 `FileExt::read_at`（pread）而非 `Read::read`，
-避免 lseek 竞争（保持一致）。
+避免 lseek 竞争。
 
 ### 2. `caps.rs` — CAP_SYS_NICE 检查
 
@@ -113,7 +113,7 @@ ProcessEvent → 读取 pkg（事件自带 or fallback /proc）
 
 ### 5. `proc_source.rs` — ProcSource
 
-**发现策略**（既有实现 `proc_mode` 演进）：
+**发现策略**（proc 轮询模式演进）：
 - sysinfo 进程总数变化 → 全量扫描（遍历 /proc 全目录）
 - 稳定 → 增量路径（只检查 tracked pid 的线程增量 + kill 存活）
 - Exit 检测：tracked pid 不在当前 /proc 中 → 产出 `ProcessEvent::exit`
@@ -148,9 +148,9 @@ Mutex 为 P4 IPC 线程访问铺路）。
 
 ---
 
-## 设计差异对照
+## 与常见 proc 轮询实现的差异
 
-| 维度 | 既有实现 | threadctl v2 |
+| 维度 | 常见 proc 轮询实现 | threadctl v2 |
 |---|---|---|
 | 事件源 | if-else 主循环（ebpf/proc 分支） | `EventSource` trait（可插拔） |
 | 状态管理 | 散落 HashMap（`process_cache`/`ProcCache`） | 统一 `StateTracker`（含引用计数） |
@@ -158,7 +158,7 @@ Mutex 为 P4 IPC 线程访问铺路）。
 | cpuset 目录 | 只建不删（泄漏） | 引用计数 + 归零 rmdir 回收 |
 | 事件→应用 | proc 模式串行全扫 + 5 轮 apply | 事件驱动 + Fork 立即全扫 + ThreadClone 增量 |
 | 权限检查 | 无 | capget CAP_SYS_NICE 检查 |
-| relock | 无（既有实现 没有对抗覆盖的需求？） | 有（v1 继承，Android 刚需） |
+| relock | 通常无 | 有（v1 继承，Android 刚需） |
 
 ---
 
@@ -188,7 +188,7 @@ relock: 重应用 1 个线程
    （如同目录被两个进程引用，一个退出时归零→ rmdir，另一个进程后续写入失败）
 3. **ProcSource 事件重复**：Fork 事件后 engine 做全扫（refresh 更新 applied_tids），
    下轮 poll 增量检测 `applied_tids` 差集——是否有事件漏发？（如 fork 后立即创建新线程）
-4. **sysinfo.procs 变化阈值**：当前 `proc_total != last_proc_total` 即全扫（既有实现 用 +11），
+4. **sysinfo.procs 变化阈值**：当前 `proc_total != last_proc_total` 即全扫（加阈值避免频繁全扫），
    Android 上 task 频繁创建是否导致过度全扫？
 5. **单测覆盖盲区**：engine 层（`refresh_process_rules`/`relock_all`）因需要真实 /proc，
    未加单元测试——是否有推荐的 mock 方式？

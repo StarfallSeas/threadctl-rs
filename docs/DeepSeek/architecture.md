@@ -3,8 +3,8 @@
 > 本文档描述 threadctl-rs 全新重写版的架构规划与实现现状（P0 + P1 已完成）。
 > 由 DeepSeek-V4 生成并持续更新，供 Claude 审核与确认。
 >
-> 上下文：本程序**不是** 既有实现 的延续版本，而是借鉴 既有实现 部分已验证的设计思路，
-> 结合原 threadctl v1 的既有方案，全新设计的一个事件驱动的 Linux/Android 线程调度优化守护进程。
+> 上下文：threadctl-rs 是独立设计的全新实现——事件驱动的 Linux/Android 线程调度优化守护进程，
+> 采用 Linux eBPF 生态通用模式（tracepoint 事件源 + ringbuf）与 threadctl v1 的既有方案，
 > eBPF 内核态保留并扩展。
 
 ---
@@ -21,7 +21,7 @@
 
 ## 2. 设计来源
 
-### 通用实践（已验证、保留）
+### 通用实践（Linux eBPF / Android 调度生态）
 
 1. **双模式降级链**：eBPF 不可用 → /proc 轮询；每层失败都有一级降级。
 2. **inotify 热加载 → 轮询兜底**：配置变更用 inotify 即时感知，
@@ -34,7 +34,7 @@
 ### 从 threadctl v1（原目录已备份至 `代码仓库/threadctl-v1-backup.tar.gz`）继承
 
 1. **TOML 配置** + serde：`[daemon]` / `[engine]` / `[[rule]]` 结构，旧配置零迁移。
-2. **relock 周期锁定**（既有实现 没有）：周期重应用亲和性，对抗 Android 侧覆盖。
+2. **relock 周期锁定**：周期重应用亲和性，对抗 Android 侧覆盖。
 3. **sched 策略**：fifo / rr / batch / idle + nice，不止亲和性。
 4. **IPC 控制面**：Unix socket JSON-line 协议（v1 是空壳，v2 完整实现）。
 
@@ -47,7 +47,7 @@
 | IPC 空壳（dump 恒 0） | 挂到 Tracker/ConfigStore 真实数据上 |
 | 无信号处理 | SIGTERM/INT 优雅退出、SIGHUP 重载、SIGUSR1 统计 |
 | pid_file 只配置不写 | 启动写入、退出删除 |
-| cpuset 目录只建不删（既有实现 同样缺陷） | Tracker 引用计数归零 → rmdir 回收 |
+| cpuset 目录只建不删 | Tracker 引用计数归零 → rmdir 回收 |
 
 ---
 
@@ -133,7 +133,7 @@ trait EventSource: Send {
 ### 4.4 规则引擎（纯函数，可单测）
 
 - `RuleSet::compile` 编译期校验（长度/CPU 范围/present 过滤），`by_pkg` 索引。
-- 语义（既有实现 已验证）：线程规则命中按位或合并；miss → 包级规则按位或合并；
+- 语义：线程规则命中按位或合并；miss → 包级规则按位或合并；
   sched/nice 取先命中。
 - **cpuset 目录名由运行时实际合并 CPU 派生**（Claude 审查 ❹ 修复），
   应用前懒创建（`ENSURED_CPUSET_DIRS` 缓存避免热路径重复 syscall）。
@@ -302,7 +302,7 @@ threadctl-rs/
 
 | 日期 | 事件 |
 |---|---|
-| 2026-08-07 | 完成需求确认：全新程序 threadctl v2（非 既有实现 延续），eBPF 内核态保留并扩展 |
+| 2026-08-07 | 完成需求确认：全新程序 threadctl v2，eBPF 内核态保留并扩展 |
 | 2026-08-07 | 备份并清空旧 threadctl-rs，P0 workspace 骨架完成（core/daemon/ebpf） |
 | 2026-08-07 | 架构文档生成，交 Claude 审查 |
 | 2026-08-07 | Claude 审查返回（Claude/initial-review.md）：2 Bug + 4 设计问题 + 若干次要，全部修复，Q1-Q7 定案 |

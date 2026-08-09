@@ -313,11 +313,11 @@ signal-hook = "0.3"
 
 ---
 
-## 五、与 既有实现 的运维能力对比
+## 五、运维能力一览
 
-| 维度 | 既有实现 | threadctl v2 P4 |
+| 维度 | 既有常见实现 | threadctl v2 P4 |
 |---|---|---|
-| 运行时查询 | 无 | IPC status/dump |
+| 运行时查询 | 通常无 | IPC status/dump |
 | 动态重载 | inotify 自动 | inotify + IPC reload + SIGHUP |
 | 优雅退出 | 无信号处理 | SIGTERM/INT → cleanup → exit |
 | 日志 | println! 到 stderr | tracing 结构化日志 + logcat |

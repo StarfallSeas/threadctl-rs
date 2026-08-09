@@ -89,7 +89,7 @@ ringbuf → 用户态（aya + 线程）：
 - **性能表述**（三审一致）：降低事件**发现**延迟（轮询周期级 → 内核通知级，
   near-real-time），非端到端策略生效延迟——Zygote 场景仍受 pending 退避
   （100-1400ms）主导；eBPF 对非 Zygote 的 native daemon 改善最明显
-- 依赖：`aya` + `aya-ebpf`（aya-ebpf 已有实战经验）
+- 依赖：`aya` + `aya-ebpf`
 
 ### A4. 构建链前置验证（IMPL-1，P7.1 第 0 步）
 

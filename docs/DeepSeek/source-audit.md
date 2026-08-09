@@ -156,7 +156,7 @@
 
 - ✅ 降级链完整（inotify→轮询），Mutex<Arc> 快照原子替换
 - ⚠️ **M6**：inotify 失效降级轮询后，若文件被删除，`file_mtime` 返回 -1 ≠ last_mtime → 每轮 `reload()` 失败 → **每 poll_interval 打印一次"配置重载失败"**。修复：文件不存在时静默（或降频）。
-- ⚠️ L7：DELETE_SELF 后 `sleep(poll_interval)` 才重装 watch——poll_interval=60s 时恢复监听延迟 60s。保持兼容行为，但可优化为短 sleep。
+- ⚠️ L7：DELETE_SELF 后 `sleep(poll_interval)` 才重装 watch——poll_interval=60s 时恢复监听延迟 60s。（保持兼容行为），但可优化为短 sleep。
 - ✅ 测试覆盖版本递增/坏配置保留/Arc 共享
 
 ### 2.12 tracker.rs（230 行）
@@ -206,7 +206,7 @@
 
 ### 2.19 daemon/proc_source.rs（155 行）
 
-- 🔴 **H3**：`need_full = proc_total != last_proc_total`——`sysinfo.procs` 是**任务数（含线程）**。多线程进程频繁创建/销毁线程 → procs 每轮变化 → **几乎每轮全扫**（遍历 /proc 全部 pid + 读 cmdline）。既有实现 用 +11 阈值。**修复**：`proc_total > last_proc_total + 阈值` 或仅增加时全扫；减少时依赖 Exit 检测。
+- 🔴 **H3**：`need_full = proc_total != last_proc_total`——`sysinfo.procs` 是**任务数（含线程）**。多线程进程频繁创建/销毁线程 → procs 每轮变化 → **几乎每轮全扫**（遍历 /proc 全部 pid + 读 cmdline）。**修复**：`proc_total > last_proc_total + 阈值` 或仅增加时全扫；减少时依赖 Exit 检测。
 - ✅ 增量路径（tracked 进程线程 diff）正确
 - ✅ Exit 检测双路径覆盖（全扫 + 增量）
 

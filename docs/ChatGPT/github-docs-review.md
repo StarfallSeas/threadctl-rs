@@ -216,7 +216,7 @@ Each phase: implement → write review doc → cross-AI review → fix → regre
 
 | 日期 | 参与者 | 事件 |
 |---|---|---|
-| 2026-08-07 | DeepSeek V4 Flash | 需求确认：全新重写（非 既有实现 延续），eBPF 保留；P0 workspace 骨架 |
+| 2026-08-07 | DeepSeek V4 Flash | 需求确认：全新重写，eBPF 保留；P0 workspace 骨架 |
 | 2026-08-07 | DeepSeek V4 Pro | 架构文档 `DeepSeek/architecture.md`，P1-P6 路线 |
 | 2026-08-07 | Claude Opus 4.x | P0 审查：2 P0 Bug + 4 设计问题，Q1-Q7 定案 |
 | 2026-08-07 | DeepSeek V4 Flash | P1 ConfigStore（inotify 降级链）+ P2 proc 全链路 |

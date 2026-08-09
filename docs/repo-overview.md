@@ -43,7 +43,7 @@ threadctl-rs/
 threadctl (daemon, bin)
   └── threadctl-core (lib)        ← 全部领域逻辑
         └── libc, serde, toml     （kdl 是 optional feature）
-  └── threadctl-ebpf (bin)        ← 独立，无依赖关系（待迁移 既有实现 内核程序）
+  └── threadctl-ebpf (bin)        ← 独立，无依赖关系（待实现内核程序）
 ```
 
 core 不依赖 aya / tracing——纯 syscall + 纯逻辑，这是单测友好的根基。
