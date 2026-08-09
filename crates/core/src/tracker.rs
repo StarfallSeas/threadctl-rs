@@ -141,6 +141,15 @@ impl StateTracker {
         self.procs.get_mut(&pid).unwrap()
     }
 
+    /// 线程退出（P7.1 IMPL-4）：从 applied_tids 移除单个 tid——消除 TID
+    /// 复用窗口（旧线程退出后新线程复用同一 TID 会被 applied_tids 误判已应用）。
+    /// 进程级退出仍走 remove()。
+    pub fn remove_tid(&mut self, pid: i32, tid: i32) {
+        if let Some(state) = self.procs.get_mut(&pid) {
+            state.applied_tids.remove(&tid);
+        }
+    }
+
     /// 移除进程：释放其全部 cpuset 引用，归零目录 rmdir 回收。
     pub fn remove(&mut self, pid: i32) -> bool {
         let Some(state) = self.procs.remove(&pid) else {

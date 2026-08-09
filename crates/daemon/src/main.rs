@@ -2,6 +2,7 @@
 //!
 //! P2: Orchestrator main loop (P1 hot-reload + ProcSource event pipeline + relock + cleanup).
 
+mod ebpf_source;
 mod proc_source;
 
 use std::env;
@@ -23,6 +24,7 @@ use threadctl_core::system_context::{AdaptivePoller, PressureLevel, SystemContex
 use threadctl_core::topology::init_cpu_topo;
 use threadctl_core::tracker::StateTracker;
 
+use ebpf_source::EbpfSource;
 use proc_source::ProcSource;
 
 /// 单调秒。
@@ -150,9 +152,19 @@ fn main() {
     let _ = &decision_engine; // P6 深度接入策略决策，当前初始化并保留
 
     let tracker = Arc::new(Mutex::new(StateTracker::new()));
-    // P7.1（ARCH-1）：事件源走 trait 对象注入——ProcSource（/proc 轮询）为默认，
-    // EbpfSource（内核事件驱动）就绪后在此按降级链选择（BTF/加载失败 → proc）。
-    let mut source: Box<dyn EventSource> = Box::new(ProcSource::new(tracker.clone()));
+    // P7.1（ARCH-1）：事件源走 trait 对象注入——EbpfSource 优先（内核事件驱动，
+    // near-real-time 事件发现），加载/attach 任何失败 → 回退 ProcSource（/proc 轮询）。
+    // 构建产物需把 threadctl-ebpf .bpf.o 与 daemon 放同目录。
+    let mut source: Box<dyn EventSource> = match EbpfSource::try_new(tracker.clone()) {
+        Ok(s) => {
+            println!("event source: ebpf (kernel tracepoints)");
+            Box::new(s)
+        }
+        Err(e) => {
+            eprintln!("warning: ebpf unavailable ({e}) — falling back to /proc polling");
+            Box::new(ProcSource::new(tracker.clone()))
+        }
+    };
     source.on_config_changed(&cfg);
 
     let reload_rx = spawn_hot_reload(store.clone(), scan_interval.max(cfg.engine.scan_interval));

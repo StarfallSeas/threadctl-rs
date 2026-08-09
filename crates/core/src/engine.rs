@@ -51,7 +51,13 @@ fn handle_event(
 ) -> usize {
     match ev.kind {
         EventKind::Exit => {
-            tracker.remove(ev.pid);
+            // P7.1 IMPL-4：线程退出（tid != pid）→ 清单个 tid 的 applied_tids
+            // （修 TID 复用窗口）；进程退出 → 整进程移除。
+            if ev.tid != ev.pid {
+                tracker.remove_tid(ev.pid, ev.tid);
+            } else {
+                tracker.remove(ev.pid);
+            }
             0
         }
         EventKind::CpuMigrate => 0, // P5

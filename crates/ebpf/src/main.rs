@@ -186,11 +186,15 @@ fn sched_process_exec(_ctx: TracePointContext) -> u32 {
 
 /// 进程/线程退出（IMPL-4：用户态即时清 applied_tids，修 TID 复用窗口）。
 #[tracepoint(name = "sched_process_exit", category = "sched")]
-fn sched_process_exit(ctx: TracePointContext) -> u32 {
-    // format（5.15）：comm[16]@8, pid@24, prio@28
-    let comm = unsafe { ctx.read_at::<[u8; 16]>(8).unwrap_or([0u8; 16]) };
-    let pid = unsafe { ctx.read_at::<i32>(24).unwrap_or(0) };
-    submit_event(pid, pid, 0, comm, EVENT_EXIT);
+fn sched_process_exit(_ctx: TracePointContext) -> u32 {
+    // current 即退出任务：tgid=进程 pid，pid=任务（线程退出时 pid 是线程 tid）。
+    // 用 helper 而非参数读取——tracepoint 参数只有退出任务 pid（无 tgid），
+    // 用户态分流需要 tgid（线程退出时 /proc/<tid> 已消失，无法事后读）。
+    let pid_tgid = bpf_get_current_pid_tgid();
+    let tgid = (pid_tgid >> 32) as i32;
+    let tid = pid_tgid as i32;
+    let comm = bpf_get_current_comm().unwrap_or_default();
+    submit_event(tgid, tid, 0, comm, EVENT_EXIT);
     0
 }
 

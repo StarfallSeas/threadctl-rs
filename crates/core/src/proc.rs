@@ -68,6 +68,21 @@ pub fn read_oom_adj(pid: i32) -> i32 {
         .unwrap_or(0)
 }
 
+/// 读 `/proc/<pid>/status` 的 Tgid（P7.1 fork 分流：Tgid == Pid → 进程 fork；
+/// Tgid != Pid → 线程 clone——eBPF fork 事件无法从 tracepoint 参数拿 child tgid，
+/// 用户态 pending 后读这里，与 Zygote pending 天然合并）。
+pub fn read_tgid(pid: i32) -> Option<i32> {
+    let status = fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    status.lines().find_map(|l| {
+        let l = l.trim();
+        if let Some(v) = l.strip_prefix("Tgid:") {
+            v.trim().parse::<i32>().ok()
+        } else {
+            None
+        }
+    })
+}
+
 /// Process liveness (Claude DESIGN-3: kill(pid,0) may return EPERM under
 /// SELinux restrictions for an alive process — EPERM means "exists but no
 /// signal permission", must be treated as alive, otherwise running processes

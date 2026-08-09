@@ -166,6 +166,11 @@ pub struct CompileResult {
 }
 
 impl RuleSet {
+    /// 配置中出现的包名列表（P7.1 eBPF 白名单键生成用）。
+    pub fn pkgs(&self) -> &[String] {
+        &self.pkgs
+    }
+
     /// 编译配置中的规则列表；无效规则计入 errors 并跳过。
     pub fn compile(configs: &[RuleConfig], topo: &CpuTopology) -> CompileResult {
         let mut rules: Vec<CompiledRule> = Vec::new();

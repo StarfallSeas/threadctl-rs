@@ -11,3 +11,4 @@ path = "src/main.rs"
 [dependencies]
 threadctl-core = { path = "../core" }
 libc = "0.2"
+aya = "0.14"
