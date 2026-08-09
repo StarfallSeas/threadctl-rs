@@ -112,6 +112,11 @@ fn main() {
             cl.kind, cl.range_str, cl.capacity
         );
     }
+    // P6.3 M2：DVFS 域打印（policyN 分组，用户可对照官方规格/电压表）
+    if !topo.dvfs_domains.is_empty() {
+        let parts: Vec<String> = topo.dvfs_domains.iter().map(|d| d.to_range_string()).collect();
+        println!("DVFS domains: [{}]", parts.join(", "));
+    }
 
     let store = match ConfigStore::new(&config_file, topo.clone()) {
         Ok(s) => s,

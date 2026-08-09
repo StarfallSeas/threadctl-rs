@@ -171,12 +171,14 @@ fn push_range(s: &mut String, start: Option<usize>, end: Option<usize>, first: &
 }
 
 /// 解析 CPU 范围字符串，可选 present 过滤。
+/// 兼容两种分隔：配置用逗号（"0-3,6-7"），sysfs related_cpus/affected_cpus
+/// 用空格（"0 1 2"）——P6.3 M2 DVFS 域探测依赖此兼容。
 pub fn parse_cpu_ranges(spec: &str, present: Option<&CpuSet>) -> CpuSet {
     let mut set = CpuSet::new();
     if spec.is_empty() {
         return set;
     }
-    for part in spec.split(',') {
+    for part in spec.split(|c| c == ',' || c == ' ' || c == '\t') {
         let part = part.trim();
         if part.is_empty() {
             continue;
@@ -312,6 +314,41 @@ pub struct CpuCluster {
     pub capacity: u32,
 }
 
+/// DVFS 域探测（P6.3 M2）：枚举 `/sys/devices/system/cpu/cpufreq/policyN/`，
+/// 读 `related_cpus`（完整频率域，含离线 CPU，优先），缺失时 fallback
+/// `affected_cpus`（在线子集）——CLAUDE P6.3-规划-3。
+///
+/// 返回按 policy 序号升序的域成员集合（如 SM8550: [{0-2},{3-6},{7}]）。
+/// 无 cpufreq 接口时返回空（cpuset 通道仍可用）。
+pub fn detect_dvfs_domains() -> Vec<CpuSet> {
+    let mut domains: Vec<(usize, CpuSet)> = Vec::new();
+    let Ok(entries) = fs::read_dir("/sys/devices/system/cpu/cpufreq") else {
+        return Vec::new();
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let Some(policy) = name.strip_prefix("policy") else {
+            continue;
+        };
+        let Ok(pol_idx) = policy.parse::<usize>() else {
+            continue;
+        };
+        let base = format!("/sys/devices/system/cpu/cpufreq/{name}");
+        // related_cpus 优先（完整域），affected_cpus fallback（在线子集）
+        let raw = fs::read_to_string(format!("{base}/related_cpus"))
+            .or_else(|_| fs::read_to_string(format!("{base}/affected_cpus")))
+            .ok();
+        let Some(raw) = raw else { continue };
+        let set = parse_cpu_ranges(raw.trim(), None);
+        if set.count() > 0 {
+            domains.push((pol_idx, set));
+        }
+    }
+    domains.sort_by_key(|(idx, _)| *idx);
+    domains.into_iter().map(|(_, set)| set).collect()
+}
+
 /// 读取 `/sys/devices/system/cpu/cpuN/cpu_capacity`，按容量分组自动识别集群。
 pub fn detect_clusters() -> Vec<CpuCluster> {
     use std::collections::BTreeMap;
@@ -389,6 +426,9 @@ pub struct CpuTopology {
     pub base_cpuset_fd: RawFd,
     /// CPU 集群（基于 cpu_capacity 自动检测），同类容量归一组，按容量升序排列。
     pub clusters: Vec<CpuCluster>,
+    /// DVFS 域（cpufreq policy 分组；related_cpus 优先/affected_cpus fallback）。
+    /// P6.3 M2：只读探测，供日志核对与未来绑核优化（同域同频）。
+    pub dvfs_domains: Vec<CpuSet>,
 }
 
 impl Default for CpuTopology {
@@ -402,6 +442,7 @@ impl Default for CpuTopology {
             cpuset_enabled: false,
             base_cpuset_fd: -1,
             clusters: Vec::new(),
+            dvfs_domains: Vec::new(),
         }
     }
 }
@@ -421,6 +462,9 @@ pub fn init_cpu_topo() -> CpuTopology {
 
     // CPU 集群检测（big.LITTLE 自动识别）
     topo.clusters = detect_clusters();
+
+    // P6.3 M2：DVFS 域探测（cpufreq policyN/related_cpus，fallback affected_cpus）
+    topo.dvfs_domains = detect_dvfs_domains();
 
     let root = CString::new("/dev/cpuset").expect("常量字符串无 NUL");
     if unsafe { libc::access(root.as_ptr(), libc::F_OK) } != 0 {
@@ -547,5 +591,20 @@ mod tests {
         let set = parse_cpu_ranges(s, None);
         assert_eq!(set.to_range_string(), s);
         assert_eq!(set.count(), 6);
+    }
+
+    #[test]
+    fn parse_sysfs_space_separated() {
+        // P6.3 M2：sysfs related_cpus/affected_cpus 是空格分隔（"0 1 2"），
+        // 与配置的逗号格式兼容解析
+        let set = parse_cpu_ranges("0 1 2", None);
+        assert_eq!(set.to_range_string(), "0-2");
+        assert_eq!(set.count(), 3);
+
+        let set = parse_cpu_ranges("3 4 5 6", None);
+        assert_eq!(set.to_range_string(), "3-6");
+
+        let set = parse_cpu_ranges("0 1,4-5", None);
+        assert_eq!(set.to_range_string(), "0-1,4-5");
     }
 }
