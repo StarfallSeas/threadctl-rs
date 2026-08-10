@@ -1,4 +1,6 @@
-# P7 规划书 v2（定稿）— eBPF 事件源 · 算法增强 · 系统架构
+# P7 Roadmap — Event Driven Architecture & System Integration
+
+# 中文版：P7 规划书 v2（定稿）— eBPF 事件源 · 算法增强 · 系统架构
 
 > 作者：DeepSeek V4 Flash（执行者）
 > 审核：ChatGPT（文档/架构）· Claude（架构/代码）——意见已齐，裁决完成

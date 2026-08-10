@@ -190,6 +190,25 @@ app "com.example.game" {
 
 ---
 
+## AI Collaboration
+
+threadctl-rs is an **AI-driven software engineering experiment**: multiple
+AI models collaboratively produce architecture, implementation, review and
+documentation. Humans own direction, final decisions and real-device validation.
+
+| Role | Model | Responsibility |
+|---|---|---|
+| Implementation | DeepSeek V4 Flash | architecture, code, engineering |
+| Code review | Claude | code-level architecture review, defect finding |
+| Docs/spec review | ChatGPT | documentation audit, engineering standards |
+| Human (maintainer) | — | requirements, final decisions, device validation |
+
+> Responsibility boundary: AI provides engineering capability, the human
+> keeps decision authority — whether to adopt a proposal, change architecture,
+> or ship a release. See `docs/AI-workflow.md` for the full process.
+
+---
+
 ## Architecture
 
 ### Layers
@@ -317,6 +336,9 @@ fork/exec events and sched_switch migration observation.
 
 ## Limitations
 
+- This repository documents AI-assisted development; **AI-generated decisions
+  may contain mistakes** — every architectural decision requires source review,
+  compilation and hardware validation, regardless of being AI-generated.
 - Only **whitelisted** packages are constrained; unconfigured processes keep system defaults (no fallback enforcement)
 - Thread names >15 bytes get truncated by the kernel — use `thread-type` or check startup warnings
 - Android AMS moves cpuset ownership when an app goes background; relock is the countermeasure (background processes are not re-locked, restored on foreground return)
