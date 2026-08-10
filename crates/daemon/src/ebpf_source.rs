@@ -1,6 +1,6 @@
 //! EbpfSource — kernel-event event source (P7.1).
 //!
-//! Loads `threadctl-ebpf` .bpf.o via aya, attaches fork/exec/exit tracepoints,
+//! Loads `threadctl-ebpf` (bpfel-unknown-none ELF) via aya, attaches fork/exec/exit tracepoints,
 //! consumes the ringbuf in a reader thread → mpsc channel → `poll()`.
 //!
 //! Event semantics:
@@ -61,11 +61,14 @@ pub struct EbpfSource {
     _bpf: aya::Ebpf,
     cfg: Option<Arc<ConfigSnapshot>>,
     pending: Vec<PendingFork>,
+    /// 启动时初始全扫（eBPF 只捕获启动后的 fork——启动前已运行的白名单
+    /// 进程需一次全扫兜底，与 ProcSource 的 scan_all=true 等价）。
+    initial_scan_done: bool,
 }
 
 impl EbpfSource {
     /// 尝试加载 eBPF；任何失败返回 Err（调用方回退 ProcSource）。
-    pub fn try_new(tracker: Arc<Mutex<StateTracker>>) -> Result<Self, String> {
+    pub fn try_new(tracker: Arc<Mutex<StateTracker>>, cfg: &ConfigSnapshot) -> Result<Self, String> {
         // 1. 定位 .bpf.o（与 daemon 二进制同目录）
         let ebpf_path = std::env::current_exe()
             .ok()
@@ -74,9 +77,13 @@ impl EbpfSource {
             .ok_or("threadctl-ebpf 二进制不存在（需与 daemon 同目录）")?;
         let data = std::fs::read(&ebpf_path).map_err(|e| format!("读取 {} 失败: {e}", ebpf_path.display()))?;
 
-        // 2. 加载（TARGET_COMM_MAP 容量初始 64；on_config_changed 时按包名数重建）
+        // 2. 加载。CLAUDE BUG-H1：BPF HashMap 容量加载时固定，不能运行时扩容——
+        // 按配置包数计算容量（每包 2 键，next_power_of_two，下限 64），
+        // 避免 32+ 包时 insert 静默失败退化为全扫兜底。
+        let pkg_count = cfg.rules.pkgs().len();
+        let cap = ((pkg_count * 2) as u32).next_power_of_two().max(64);
         let mut loader = aya::EbpfLoader::new();
-        loader.map_max_entries("TARGET_COMM_MAP", 64);
+        loader.map_max_entries("TARGET_COMM_MAP", cap);
         let mut bpf = loader.load(&data).map_err(|e| format!("eBPF 加载失败: {e}"))?;
 
         // 3. attach 三个 tracepoint（任一失败 → 回退）
@@ -134,6 +141,7 @@ impl EbpfSource {
             _bpf: bpf,
             cfg: None,
             pending: Vec::new(),
+            initial_scan_done: false,
         })
     }
 
@@ -180,11 +188,42 @@ impl EbpfSource {
         for k in &old {
             let _ = target.remove(k);
         }
-        // 插新
-        for key in Self::target_entries(cfg.rules.pkgs()) {
+        // 插新（CLAUDE LOW-1：target_entries 只调一次——排序去重有分配开销）
+        let entries = Self::target_entries(cfg.rules.pkgs());
+        let n = entries.len();
+        for key in entries {
             let _ = target.insert(key, 1, 0);
         }
-        println!("ebpf whitelist: {} entries ({} pkgs)", Self::target_entries(cfg.rules.pkgs()).len(), cfg.rules.pkgs().len());
+        println!("ebpf whitelist: {n} entries ({} pkgs)", cfg.rules.pkgs().len());
+    }
+
+    /// 启动时初始全扫：遍历 /proc 产 Fork 事件（eBPF 只捕获启动后的 fork，
+    /// 启动前已运行的白名单进程需兜底——与 ProcSource scan_all=true 等价）。
+    fn initial_scan(&mut self, events: &mut Vec<ProcessEvent>) {
+        let Some(cfg) = self.cfg.clone() else {
+            return;
+        };
+        let rules = &cfg.rules;
+        let Ok(dir) = std::fs::read_dir("/proc") else {
+            return;
+        };
+        let mut scanned = 0usize;
+        for entry in dir.flatten() {
+            let Ok(pid) = entry.file_name().to_string_lossy().parse::<i32>() else {
+                continue;
+            };
+            let Some(pkg) = read_cmdline(pid) else {
+                continue;
+            };
+            if pkg.is_empty() || !rules.is_interested(&pkg) {
+                continue;
+            }
+            events.push(ProcessEvent::fork(pid, pid).with_pkg(pkg));
+            scanned += 1;
+        }
+        if scanned > 0 {
+            println!("ebpf initial scan: {scanned} whitelisted processes");
+        }
     }
 
     /// 非阻塞排空 mpsc → 处理。
@@ -206,7 +245,11 @@ impl EbpfSource {
         match ev.event_type {
             EVENT_FORK => {
                 // Zygote 空窗：fork 后 cmdline 短暂为空 → pending 退避重读。
-                if self.pending.len() < PENDING_MAX_PENDING {
+                // CLAUDE BUG-M1：内核防抖允许同 pid 0.1s 内 2 事件 → 去重，
+                // 否则同一 child_pid 进 pending 两次产生重复 Fork。
+                if self.pending.len() < PENDING_MAX_PENDING
+                    && !self.pending.iter().any(|p| p.child_pid == ev.pid)
+                {
                     self.pending.push(PendingFork {
                         child_pid: ev.pid,
                         retry: 0,
@@ -291,12 +334,25 @@ impl EbpfSource {
 impl EventSource for EbpfSource {
     fn poll(&mut self, deadline: Instant) -> Vec<ProcessEvent> {
         let mut events = Vec::new();
+        // 启动时初始全扫一次（eBPF 捕获启动后的 fork；启动前已运行进程兜底）
+        if !self.initial_scan_done {
+            self.initial_scan(&mut events);
+            self.initial_scan_done = true;
+        }
         self.drain(&mut events);
         if events.is_empty() {
-            // 空轮：休眠至 deadline（与 ProcSource 节奏一致）。
+            // 空轮：休眠至 min(deadline, pending 最早退避时刻)。
+            // CLAUDE BUG-M2：否则 100ms 的 pending 退避会被 2s 轮询周期
+            // 膨胀成最差 2.1s——Zygote 场景与 ProcSource 无差别。
+            let wake = self
+                .pending
+                .iter()
+                .map(|p| p.next)
+                .min()
+                .map_or(deadline, |min_next| deadline.min(min_next));
             let now = Instant::now();
-            if now < deadline {
-                std::thread::sleep(deadline - now);
+            if now < wake {
+                std::thread::sleep(wake - now);
             }
         }
         events
@@ -309,4 +365,49 @@ impl EventSource for EbpfSource {
     }
 
     fn shutdown(&mut self) {}
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(s: &str) -> [u8; 8] {
+        let mut k = [0u8; 8];
+        let b = s.as_bytes();
+        let n = b.len().min(8);
+        k[..n].copy_from_slice(&b[..n]);
+        k
+    }
+
+    #[test]
+    fn target_entries_short_pkg() {
+        // CLAUDE LOW-4：<=8 字节包名 -> 仅前缀键
+        let entries = EbpfSource::target_entries(&["sleep".into()]);
+        assert_eq!(entries, vec![key("sleep")]);
+    }
+
+    #[test]
+    fn target_entries_long_pkg_prefix_and_suffix() {
+        // 长包名 -> 前 8 + 末 8 两个键
+        let entries = EbpfSource::target_entries(&["com.tencent.mm".into()]);
+        assert_eq!(entries.len(), 2);
+        assert!(entries.contains(&key("com.tenc")));
+        assert!(entries.contains(&key("ncent.mm"))); // 末 8 字节
+    }
+
+    #[test]
+    fn target_entries_dedup_and_empty() {
+        // 去重 + 空包名跳过
+        let entries = EbpfSource::target_entries(&["com.a".into(), "com.a".into(), String::new()]);
+        assert_eq!(entries.len(), 1);
+    }
+
+    #[test]
+    fn target_entries_multiple_pkgs() {
+        // 多包名：键排序去重
+        let entries = EbpfSource::target_entries(&["bb".into(), "aa".into()]);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0], key("aa"), "排序后 aa 在前");
+    }
 }

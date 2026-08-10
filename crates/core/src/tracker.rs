@@ -225,6 +225,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn remove_tid_clears_single_tid() {
+        // P7.1 IMPL-4（CLAUDE LOW-4）：线程退出 → applied_tids 移除单个 tid，
+        // 消除 TID 复用窗口（旧线程退出后新线程复用同一 TID 不再被误判已应用）。
+        let mut tracker = StateTracker::new();
+        tracker.enter(1, "com.a".into(), 100);
+        tracker.record_applied_tids(1, &[101, 102, 103].into_iter().collect());
+
+        // 线程 102 退出：仅移除该 tid
+        tracker.remove_tid(1, 102);
+        let tids: HashSet<i32> = tracker.get(1).expect("进程仍在").applied_tids.clone();
+        assert!(tids.contains(&101));
+        assert!(!tids.contains(&102), "线程 102 已退出，应从 applied_tids 移除");
+        assert!(tids.contains(&103));
+
+        // 不存在的 tid：无副作用
+        tracker.remove_tid(1, 999);
+        let tids: HashSet<i32> = tracker.get(1).expect("进程仍在").applied_tids.clone();
+        assert_eq!(tids.len(), 2);
+
+        // 不存在的进程：无副作用
+        tracker.remove_tid(999, 101);
+    }
+
+    #[test]
     fn remove_releases_cpuset_refs() {
         let mut tracker = StateTracker::new();
         tracker.enter(1, "com.a".into(), 100);

@@ -87,9 +87,10 @@ start() {
         log "WARN: 未找到 $EBPF——回退 /proc 轮询（可将 threadctl-ebpf 复制到本目录）"
     fi
 
-    # 后台启动，输出重定向到同目录日志；记录 PID
+    # 后台启动（nohup 脱离 SIGHUP——否则 su/Termux 会话退出会杀死 daemon），
+    # 输出重定向到同目录日志；记录 PID
     # shellcheck disable=SC2086  # CONF_OPT 需分字（-c 与路径两个参数）
-    "$BIN" $CONF_OPT >>"$LOG" 2>&1 &
+    nohup "$BIN" $CONF_OPT >>"$LOG" 2>&1 &
     BPID=$!
     echo "$BPID" > "$PID"
 

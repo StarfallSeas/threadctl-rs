@@ -155,7 +155,7 @@ fn main() {
     // P7.1（ARCH-1）：事件源走 trait 对象注入——EbpfSource 优先（内核事件驱动，
     // near-real-time 事件发现），加载/attach 任何失败 → 回退 ProcSource（/proc 轮询）。
     // 构建产物需把 threadctl-ebpf .bpf.o 与 daemon 放同目录。
-    let mut source: Box<dyn EventSource> = match EbpfSource::try_new(tracker.clone()) {
+    let mut source: Box<dyn EventSource> = match EbpfSource::try_new(tracker.clone(), &cfg) {
         Ok(s) => {
             println!("event source: ebpf (kernel tracepoints)");
             Box::new(s)

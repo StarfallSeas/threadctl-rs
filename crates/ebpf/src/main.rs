@@ -33,7 +33,8 @@ const EVENT_EXIT: u32 = 3;
 /// 进程/线程事件（#[repr(C)] 布局与用户态 threadctl_core::ebpf::EbpfProcEvent 一致）
 #[repr(C)]
 pub struct ProcEvent {
-    /// FORK: child_pid；EXEC: tgid；EXIT: 退出任务 pid（线程退出=pid==tid）
+    /// FORK: child_pid；EXEC: tgid；EXIT: tgid（进程 PID——CLAUDE LOW-2
+    /// 修正：exit 经 helper 带出 tgid，线程退出时 pid(=tgid) != tid）
     pub pid: i32,
     /// FORK: child_pid；EXEC: pid；EXIT: 同 pid
     pub tid: i32,
@@ -49,8 +50,9 @@ struct DedupEntry {
     count: u32,
 }
 
-/// 白名单键容量（用户态 EbpfLoader::set_max_entries 按包名数动态覆盖）。
-const MAP_CAPACITY: u32 = 512;
+/// 白名单键容量默认值（CLAUDE BUG-H1：BPF map 容量加载时固定——
+/// 用户态 EbpfLoader::map_max_entries 按实际包名数覆盖，此值仅兜底）。
+const MAP_CAPACITY: u32 = 1024;
 /// 防抖表容量（LruHashMap，高频进程 evict）。
 const DEDUP_CAPACITY: u32 = 4096;
 /// 防抖窗口：0.1 秒（纳秒）。
@@ -68,7 +70,7 @@ static TARGET_COMM_MAP: HashMap<[u8; 8], u32> = HashMap::with_max_entries(MAP_CA
 static DEDUP_MAP: LruHashMap<u32, DedupEntry> = LruHashMap::with_max_entries(DEDUP_CAPACITY, 0);
 
 #[map]
-static EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
+static EVENTS: RingBuf = RingBuf::with_byte_size(1024 * 1024, 0);
 
 /// 防抖：窗口内每 pid 最多 DEDUP_MAX_COUNT 事件。
 #[inline(always)]
