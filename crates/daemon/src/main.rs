@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use threadctl_core::audit;
+use threadctl_core::debug;
 use threadctl_core::capability::CapabilitySet;
 use threadctl_core::caps::can_rt_sched;
 use threadctl_core::config::ConfigSnapshot;
@@ -22,6 +23,8 @@ use threadctl_core::foreground::refresh_foreground_uids;
 use threadctl_core::store::{spawn_hot_reload, ConfigStore};
 use threadctl_core::system_context::{AdaptivePoller, PressureLevel, SystemContext};
 use threadctl_core::topology::init_cpu_topo;
+use threadctl_core::relock::{sample_coverage, AdaptiveRelock, RelockGuard, SAMPLE_INTERVAL_SECS};
+use threadctl_core::topology::BASE_CPUSET;
 use threadctl_core::tracker::StateTracker;
 
 use ebpf_source::EbpfSource;
@@ -43,6 +46,7 @@ fn print_help(prog: &str) {
     println!("Options:");
     println!("  -c <file>     Config file (default: ./threadctl.toml)");
     println!("  -s <secs>     Scan interval in seconds (default: 2)");
+    println!("  --debug       Verbose debug logging (or env TC_DEBUG=1)");
     println!("  -v            Print version");
     println!("  -h            Print help");
 }
@@ -81,6 +85,9 @@ fn main() {
                 println!("threadctl-rs {}", env!("CARGO_PKG_VERSION"));
                 process::exit(0);
             }
+            "--debug" => {
+                debug::set_debug(true);
+            }
             "-h" => {
                 print_help(prog);
                 process::exit(0);
@@ -92,6 +99,14 @@ fn main() {
             }
         }
         i += 1;
+    }
+
+    // TC_DEBUG 环境变量兜底（--debug 优先，env 适用脚本/su 场景）
+    if env::var("TC_DEBUG").map(|v| v == "1").unwrap_or(false) {
+        debug::set_debug(true);
+    }
+    if debug::enabled() {
+        println!("[debug] debug logging enabled (TC_DEBUG=1 / --debug)");
     }
 
     // 配置不存在时生成默认模板。
@@ -172,6 +187,11 @@ fn main() {
     let mut last_lock = now_secs();
     let mut last_cleanup = now_secs();
     let mut last_fg_refresh = now_secs();
+    // P7.2（B1+D3）：自适应 relock 周期 + 统一冷却闸门（ARCH-3）
+    let mut adaptive = AdaptiveRelock::from_initial(cfg.engine.lock_interval.max(1));
+    let mut relock_guard = RelockGuard::new();
+    relock_guard.set_cooldown(1000); // D3 即时 relock 冷却 1s（防风暴）
+    let mut last_coverage_sample = now_secs();
     let mut last_audit = now_secs();
     let mut sys_ctx_poller = AdaptivePoller::new();
 
@@ -210,13 +230,38 @@ fn main() {
             }
         }
 
-        // ── relock 周期锁定（对抗 Android 侧覆盖）──
-        let lock_interval = cfg.engine.lock_interval;
-        if lock_interval > 0 && now - last_lock >= lock_interval as i64 {
-            let n = engine::relock_all(&mut lock_tracker(&tracker), &cfg, &topo, now, &build_relock_ctx(&last_sys), &decision_engine, &backend);
-            last_lock = now;
-            if n > 0 {
-                println!("relock: re-applied {n} threads");
+        // ── P7.2 B1/D3：覆盖采样 → 自适应周期 + 即时 relock（对抗 AMS 覆盖）──
+        if cfg.engine.lock_interval > 0 && now - last_coverage_sample >= SAMPLE_INTERVAL_SECS as i64 {
+            last_coverage_sample = now;
+            let ratio = sample_coverage(&lock_tracker(&tracker), BASE_CPUSET);
+            let before = adaptive.interval_secs();
+            adaptive.observe_ratio(ratio);
+            let after = adaptive.interval_secs();
+            if after != before {
+                println!("adaptive relock: {}s -> {}s (coverage {:.0}%)", before, after, ratio * 100.0);
+            }
+            // D3：检测到覆盖 → 不等周期即时 relock（guard 1s 冷却防风暴；
+            // 与周期 relock 共享 guard，防 AMS↔threadctl 震荡）
+            if ratio > 0.0 && relock_guard.try_lock(Instant::now()) {
+                let n = engine::relock_all(&mut lock_tracker(&tracker), &cfg, &topo, now, &build_relock_ctx(&last_sys), &decision_engine, &backend);
+                last_lock = now;
+                if n > 0 {
+                    println!("d3 immediate relock: re-applied {n} threads");
+                }
+            }
+        }
+
+        // ── relock 周期锁定（对抗 Android 侧覆盖；B1 自适应周期）──
+        if cfg.engine.lock_interval > 0 {
+            let lock_interval = adaptive.interval_secs();
+            if now - last_lock >= lock_interval as i64 {
+                if relock_guard.try_lock(Instant::now()) {
+                    let n = engine::relock_all(&mut lock_tracker(&tracker), &cfg, &topo, now, &build_relock_ctx(&last_sys), &decision_engine, &backend);
+                    last_lock = now;
+                    if n > 0 {
+                        println!("relock: re-applied {n} threads");
+                    }
+                }
             }
         }
 

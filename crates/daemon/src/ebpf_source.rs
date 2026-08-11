@@ -21,6 +21,7 @@ use threadctl_core::config::ConfigSnapshot;
 use threadctl_core::event::{EventSource, ProcessEvent};
 use threadctl_core::proc::{is_alive, read_cmdline, read_tgid};
 use threadctl_core::tracker::StateTracker;
+use threadctl_core::debug_log;
 
 /// eBPF 事件类型（与内核态 threadctl-ebpf 一致）。
 const EVENT_FORK: u32 = 1;
@@ -52,6 +53,8 @@ struct PendingFork {
 const PENDING_BACKOFF_MS: [u64; 3] = [100, 300, 1000];
 const PENDING_MAX_RETRIES: u8 = 3;
 const PENDING_MAX_PENDING: usize = 128;
+/// TRACKED_TGID_MAP 与 tracker 的同步周期（秒）——防 cleanup_dead 路径残留。
+const TRACKED_SYNC_SECS: u64 = 30;
 
 pub struct EbpfSource {
     tracker: Arc<Mutex<StateTracker>>,
@@ -68,6 +71,8 @@ pub struct EbpfSource {
     /// CLAUDE NEW-L1：initial_scan 已覆盖的进程 pid。启动窗口内 drain 到达的
     /// 同 pid FORK 事件跳过（避免重复 refresh），首次窗口结束后 clear。
     initial_scanned: HashSet<i32>,
+    /// P7.2：TRACKED_TGID_MAP 上次与 tracker 同步时刻（30s 周期）。
+    last_tracked_sync: Instant,
 }
 
 impl EbpfSource {
@@ -147,7 +152,65 @@ impl EbpfSource {
             pending: Vec::new(),
             initial_scan_done: false,
             initial_scanned: HashSet::new(),
+            last_tracked_sync: Instant::now(),
         })
+    }
+
+    /// 访问 TRACKED_TGID_MAP（P7.2）。
+    fn tracked_map(&mut self) -> Option<aya::maps::HashMap<&mut aya::maps::MapData, i32, u32>> {
+        let map = self._bpf.map_mut("TRACKED_TGID_MAP")?;
+        map.try_into().ok()
+    }
+
+    /// P7.2：插入一个已确认跟踪的 tgid（fork 确认 / initial_scan 后）。
+    fn tracked_insert(&mut self, tgid: i32) {
+        let Some(mut map) = self.tracked_map() else {
+            return;
+        };
+        let _ = map.insert(tgid, 1, 0);
+    }
+
+    /// P7.2：移除一个 tgid（进程退出事件到达时）。
+    fn tracked_remove(&mut self, tgid: i32) {
+        let Some(mut map) = self.tracked_map() else {
+            return;
+        };
+        let _ = map.remove(&tgid);
+    }
+
+    /// P7.2：与 tracker 对齐（30s 周期）——增补漏插、清理残留
+    ///（cleanup_dead / tracker.remove 路径无法逐条通知 map）。
+    fn tracked_sync(&mut self) {
+        let pids: HashSet<i32> = self
+            .tracker
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pids()
+            .into_iter()
+            .collect();
+        let Some(mut map) = self.tracked_map() else {
+            return;
+        };
+        // 增补
+        for pid in &pids {
+            let _ = map.insert(*pid, 1, 0);
+        }
+        // 清理残留（tracker 已无但 map 仍有）
+        let stale: Vec<i32> = map.keys().filter_map(|r| r.ok()).filter(|k| !pids.contains(k)).collect();
+        for k in stale {
+            let _ = map.remove(&k);
+        }
+    }
+
+    /// target_entries 的字符串版（debug 输出用）。
+    fn target_entries_debug(pkgs: &[String]) -> Vec<String> {
+        Self::target_entries(pkgs)
+            .iter()
+            .map(|k| {
+                let end = k.iter().position(|&b| b == 0).unwrap_or(8);
+                String::from_utf8_lossy(&k[..end]).into_owned()
+            })
+            .collect()
     }
 
     /// 白名单键：包名前 8 / 末 8 字节（8 字节滑动窗口——comm 15 字符裁剪，
@@ -200,6 +263,7 @@ impl EbpfSource {
             let _ = target.insert(key, 1, 0);
         }
         println!("ebpf whitelist: {n} entries ({} pkgs)", cfg.rules.pkgs().len());
+        debug_log!("ebpf", "whitelist keys: {:?}", Self::target_entries_debug(cfg.rules.pkgs()));
     }
 
     /// 启动时初始全扫：遍历 /proc 产 Fork 事件（eBPF 只捕获启动后的 fork，
@@ -223,6 +287,7 @@ impl EbpfSource {
             if pkg.is_empty() || !rules.is_interested(&pkg) {
                 continue;
             }
+            debug_log!("ebpf", "initial scan: pid={} pkg={}", pid, pkg);
             events.push(ProcessEvent::fork(pid, pid).with_pkg(pkg));
             self.initial_scanned.insert(pid);
             scanned += 1;
@@ -248,12 +313,16 @@ impl EbpfSource {
     }
 
     fn handle_raw(&mut self, ev: EbpfProcEvent, events: &mut Vec<ProcessEvent>) {
+        debug_log!("ebpf", "raw event type={} pid={} tid={} comm={:?}",
+            ev.event_type, ev.pid, ev.tid,
+            core::str::from_utf8(&ev.comm).unwrap_or("<bad>"));
         match ev.event_type {
             EVENT_FORK => {
                 // CLAUDE NEW-L1：启动窗口内 initial_scan 已覆盖的进程 → 跳过
                 //（其 Fork 事件与 initial_scan 产出的重复，引擎会多跑一次
                 // refresh_process_rules——正确但冗余 syscall）。
                 if self.initial_scanned.contains(&ev.pid) {
+                    debug_log!("ebpf", "fork pid={} skipped (initial scan covered)", ev.pid);
                     return;
                 }
                 // Zygote 空窗：fork 后 cmdline 短暂为空 → pending 退避重读。
@@ -267,6 +336,9 @@ impl EbpfSource {
                         retry: 0,
                         next: Instant::now(),
                     });
+                    debug_log!("ebpf", "fork pid={} queued (pending={})", ev.pid, self.pending.len());
+                } else {
+                    debug_log!("ebpf", "fork pid={} dropped (dedup/limit)", ev.pid);
                 }
             }
             EVENT_EXEC => {
@@ -274,7 +346,8 @@ impl EbpfSource {
                 events.push(ProcessEvent::exec(ev.pid, ev.pid));
             }
             EVENT_EXIT => {
-                // 只关心 tracker 内的进程（EXIT 全量上报，非跟踪的直接忽略）。
+                // 只关心 tracker 内的进程（内核已按 TRACKED_TGID_MAP 过滤，
+                // 到达的基本是跟踪集；此检查兜底配置变更竞态）。
                 let tracked = self
                     .tracker
                     .lock()
@@ -282,6 +355,11 @@ impl EbpfSource {
                     .contains(ev.pid);
                 if tracked {
                     events.push(ProcessEvent::exit(ev.pid, ev.tid));
+                }
+                // P7.2：进程退出（tid==pid）→ 从内核过滤表移除；
+                // 线程退出（tid!=pid）保留——进程还在跟踪集。
+                if ev.tid == ev.pid {
+                    self.tracked_remove(ev.pid);
                 }
             }
             _ => {}
@@ -318,13 +396,19 @@ impl EbpfSource {
             // Tgid 分流（P7 调研修订：fork 参数无 child tgid，用户态读 status）：
             // Tgid == Pid → 进程 fork；Tgid != Pid → 线程 clone（tgid 是进程）。
             let tgid = read_tgid(p.child_pid).unwrap_or(p.child_pid);
+            debug_log!("ebpf", "pending pid={} pkg={:?} tgid={} (process={})",
+                p.child_pid, pkg, tgid, tgid == p.child_pid);
             if tgid == p.child_pid {
                 if rules.is_interested(&pkg) {
+                    debug_log!("ebpf", "FORK pid={} pkg={} interested", p.child_pid, pkg);
                     events.push(ProcessEvent::fork(p.child_pid, p.child_pid).with_pkg(pkg));
+                    self.tracked_insert(tgid); // P7.2：确认跟踪 → 内核 EXIT 过滤表
                 }
             } else if let Some(ppkg) = read_cmdline(tgid) {
                 if rules.is_interested(&ppkg) {
+                    debug_log!("ebpf", "ThreadClone pid={} tid={} pkg={} interested", tgid, p.child_pid, ppkg);
                     events.push(ProcessEvent::thread_clone(tgid, p.child_pid).with_pkg(ppkg));
+                    self.tracked_insert(tgid);
                 }
             }
         }
@@ -354,6 +438,11 @@ impl EventSource for EbpfSource {
         self.drain(&mut events);
         // 启动窗口结束：initial_scanned 仅用于 initial_scan 同轮 drain
         self.initial_scanned.clear();
+        // P7.2：TRACKED_TGID_MAP 定期与 tracker 对齐（30s）
+        if self.last_tracked_sync.elapsed().as_secs() >= TRACKED_SYNC_SECS {
+            self.tracked_sync();
+            self.last_tracked_sync = Instant::now();
+        }
         if events.is_empty() {
             // 空轮：休眠至 min(deadline, pending 最早退避时刻)。
             // CLAUDE BUG-M2：否则 100ms 的 pending 退避会被 2s 轮询周期

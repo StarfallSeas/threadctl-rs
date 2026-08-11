@@ -19,6 +19,7 @@ use crate::policy::{self, ApplyOutcome};
 use crate::proc::{list_tids, read_cmdline};
 use crate::topology::CpuTopology;
 use crate::tracker::{StateTracker, ThreadNameCache};
+use crate::debug_log;
 
 /// 线程级刷新间隔：Fork/ThreadClone 后全线程扫描的最小间隔。
 const THREAD_SCAN_TTL_SECS: i64 = 2;
@@ -69,9 +70,12 @@ fn handle_event(
                 .or_else(|| read_cmdline(ev.pid))
                 .unwrap_or_default();
             if pkg.is_empty() {
+                debug_log!("engine", "event pid={} kind={:?} pkg empty (dropped)", ev.pid, ev.kind);
                 return 0;
             }
             if !cfg.rules.is_interested(&pkg) {
+                debug_log!("engine", "event pid={} kind={:?} pkg={} not interested (dropped)",
+                    ev.pid, ev.kind, pkg);
                 // 不再感兴趣（配置变更后残留）→ 移除跟踪。
                 if tracker.contains(ev.pid) {
                     tracker.remove(ev.pid);
@@ -152,13 +156,20 @@ fn refresh_process_rules(
     let mut dirs: Vec<String> = Vec::new();
     let tid_set: HashSet<i32> = tids.iter().copied().collect();
 
+    // 排查用：进程级是否有线程规则、tid 总数
+    debug_log!("engine", "scan pid={} pkg={} tids={} has_thread_rules={}",
+        pid, pkg, tids.len(), has_thread_rules);
+
     for tid in &tids {
         let tname = if has_thread_rules {
             tid_names.get_or_read(*tid, now).to_string()
         } else {
             String::new()
         };
+        // 排查用：线程名 + 是否命中规则（未命中的游戏线程一目了然）
         if let Some(policy) = cfg.rules.resolve(pkg, &tname) {
+            debug_log!("engine", "  tid={} name={:?} -> rule (cpus={:?} dir={:?})",
+                tid, tname, policy.cpus, policy.cpuset_dir);
             let outcome = policy::apply_thread(*tid, pkg, &policy, topo, rt_allowed, backend);
             // Claude 审查 Bug 3：SkippedNoCpus（占位规则只应用 sched）不计数 applied
             match outcome {

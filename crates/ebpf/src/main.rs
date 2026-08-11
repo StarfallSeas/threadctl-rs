@@ -7,8 +7,9 @@
 //! tracepoint：sched_process_fork / sched_process_exec / sched_process_exit
 //!   - FORK/EXEC：白名单粗过滤（TARGET_COMM_MAP 8 字节滑动窗口）
 //!     + 防抖（DEDUP_MAP，0.1s 窗口每 pid 最多 2 事件）
-//!   - EXIT：全量上报（线程退出 comm 不匹配包名键——过滤会漏线程退出，
-//!     IMPL-4 需要所有退出事件供用户态清理 applied_tids）
+//!   - EXIT：TRACKED_TGID_MAP 过滤（P7.2——用户态 fork 确认后插 tgid，
+//!     未跟踪进程的 EXIT 内核态丢弃；跟踪集内的线程/进程退出照常上报，
+//!     IMPL-4 需要它们供用户态清理 applied_tids）
 //!
 //! 事件格式对齐 SM8550 kernel 5.15 tracepoint format（已实测确认）：
 //!   fork:  parent_comm[16]@8, parent_pid@24, child_comm[16]@28, child_pid@44
@@ -64,6 +65,12 @@ const DEDUP_MAX_COUNT: u32 = 2;
 /// EXIT 不走白名单（全量上报，见模块注释）。
 #[map]
 static TARGET_COMM_MAP: HashMap<[u8; 8], u32> = HashMap::with_max_entries(MAP_CAPACITY, 0);
+
+/// P7.2（TRACKED_TGID_MAP）：已跟踪进程 tgid 集合——用户态在 fork 确认后
+/// 插入、进程退出清理。EXIT handler 查此表，未跟踪的 EXIT 直接丢弃——
+/// 消除"全量 EXIT 上报"的 ringbuf 压力（BUG-M3 根本修复，Claude 确认方案）。
+#[map]
+static TRACKED_TGID_MAP: HashMap<i32, u32> = HashMap::with_max_entries(1024, 0);
 
 /// FORK/EXEC 防抖表（高频 fork 风暴抑制）。
 #[map]
@@ -141,7 +148,7 @@ fn submit_event(pid: i32, tid: i32, child_pid: i32, comm: [u8; 16], event_type: 
         return;
     }
     if event_type != EVENT_EXIT {
-        let now_ns = bpf_ktime_get_ns();
+        let now_ns = unsafe { bpf_ktime_get_ns() };
         let dedup_key = if event_type == EVENT_FORK {
             child_pid as u32
         } else {
@@ -195,6 +202,11 @@ fn sched_process_exit(_ctx: TracePointContext) -> u32 {
     let pid_tgid = bpf_get_current_pid_tgid();
     let tgid = (pid_tgid >> 32) as i32;
     let tid = pid_tgid as i32;
+    // P7.2（TRACKED_TGID_MAP）：未跟踪进程的 EXIT 在内核态丢弃——
+    // ringbuf 压力从"全量 EXIT"降到"跟踪集"（BUG-M3 根本修复）。
+    if unsafe { TRACKED_TGID_MAP.get(&tgid) }.is_none() {
+        return 0;
+    }
     let comm = bpf_get_current_comm().unwrap_or_default();
     submit_event(tgid, tid, 0, comm, EVENT_EXIT);
     0
