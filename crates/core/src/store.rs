@@ -16,6 +16,7 @@ use std::thread;
 use std::time::{Duration, UNIX_EPOCH};
 
 use crate::config::ConfigSnapshot;
+use crate::debug_log;
 use crate::topology::CpuTopology;
 
 /// 配置存储：持有当前生效快照，提供原子替换。
@@ -48,6 +49,7 @@ impl ConfigStore {
         let new_version = cur.version + 1;
         let new_snapshot = ConfigSnapshot::load(&self.config_file, &self.topo, new_version)?;
         *self.snapshot.lock().unwrap_or_else(|e| e.into_inner()) = new_snapshot;
+        debug_log!("store", "reload: 配置重载成功 (version {new_version})");
         Ok(new_version)
     }
 

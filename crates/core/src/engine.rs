@@ -171,6 +171,8 @@ fn refresh_process_rules(
             debug_log!("engine", "  tid={} name={:?} -> rule (cpus={:?} dir={:?})",
                 tid, tname, policy.cpus, policy.cpuset_dir);
             let outcome = policy::apply_thread(*tid, pkg, &policy, topo, rt_allowed, backend);
+            // 应用结果明细（成功/降级/跳过/失败——绑定是否生效直接看这里）
+            debug_log!("engine", "    apply tid={} outcome={:?}", tid, outcome);
             // Claude 审查 Bug 3：SkippedNoCpus（占位规则只应用 sched）不计数 applied
             match outcome {
                 ApplyOutcome::Exited => continue, // 线程已退出，下次全扫收敛
@@ -328,14 +330,17 @@ pub fn relock_all(
         };
         match decision.decide_ctx(&dctx) {
             Decision::Allow { .. } => {
+                debug_log!("relock", "pid={} pkg={} allow", pid, pkg);
                 bump_relock(0);
             }
             // Skip/Degrade：跳过本轮重应用，统计原因类别（P6.2-3）
-            Decision::Skip { .. } => {
+            Decision::Skip { reason, .. } => {
+                debug_log!("relock", "pid={} pkg={} skip ({:?})", pid, pkg, reason);
                 bump_relock(1);
                 continue;
             }
-            Decision::Degrade { .. } => {
+            Decision::Degrade { reason, .. } => {
+                debug_log!("relock", "pid={} pkg={} degrade ({:?})", pid, pkg, reason);
                 bump_relock(2);
                 continue;
             }
