@@ -249,6 +249,26 @@ mod tests {
     }
 
     #[test]
+    fn remove_tid_nonexistent_pid_is_noop() {
+        // CLAUDE NEW-L2：EXIT 乱序/未知 pid → remove_tid 静默跳过，不 panic
+        let mut tracker = StateTracker::new();
+        tracker.remove_tid(999, 100);
+        assert!(tracker.get(999).is_none());
+    }
+
+    #[test]
+    fn remove_tid_nonexistent_tid_is_noop() {
+        // CLAUDE NEW-L2：tid 不在 applied_tids → 集合不变
+        let mut tracker = StateTracker::new();
+        tracker.enter(1, "com.a".into(), 100);
+        tracker.record_applied_tids(1, &[101].into_iter().collect());
+        tracker.remove_tid(1, 999);
+        let tids: HashSet<i32> = tracker.get(1).expect("进程仍在").applied_tids.clone();
+        assert_eq!(tids.len(), 1);
+        assert!(tids.contains(&101));
+    }
+
+    #[test]
     fn remove_releases_cpuset_refs() {
         let mut tracker = StateTracker::new();
         tracker.enter(1, "com.a".into(), 100);

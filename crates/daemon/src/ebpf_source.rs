@@ -12,6 +12,7 @@
 //!
 //! 降级链：任何加载失败 → `try_new` 返回 Err → main.rs 回退 ProcSource。
 
+use std::collections::HashSet;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -64,6 +65,9 @@ pub struct EbpfSource {
     /// 启动时初始全扫（eBPF 只捕获启动后的 fork——启动前已运行的白名单
     /// 进程需一次全扫兜底，与 ProcSource 的 scan_all=true 等价）。
     initial_scan_done: bool,
+    /// CLAUDE NEW-L1：initial_scan 已覆盖的进程 pid。启动窗口内 drain 到达的
+    /// 同 pid FORK 事件跳过（避免重复 refresh），首次窗口结束后 clear。
+    initial_scanned: HashSet<i32>,
 }
 
 impl EbpfSource {
@@ -142,6 +146,7 @@ impl EbpfSource {
             cfg: None,
             pending: Vec::new(),
             initial_scan_done: false,
+            initial_scanned: HashSet::new(),
         })
     }
 
@@ -219,6 +224,7 @@ impl EbpfSource {
                 continue;
             }
             events.push(ProcessEvent::fork(pid, pid).with_pkg(pkg));
+            self.initial_scanned.insert(pid);
             scanned += 1;
         }
         if scanned > 0 {
@@ -244,6 +250,12 @@ impl EbpfSource {
     fn handle_raw(&mut self, ev: EbpfProcEvent, events: &mut Vec<ProcessEvent>) {
         match ev.event_type {
             EVENT_FORK => {
+                // CLAUDE NEW-L1：启动窗口内 initial_scan 已覆盖的进程 → 跳过
+                //（其 Fork 事件与 initial_scan 产出的重复，引擎会多跑一次
+                // refresh_process_rules——正确但冗余 syscall）。
+                if self.initial_scanned.contains(&ev.pid) {
+                    return;
+                }
                 // Zygote 空窗：fork 后 cmdline 短暂为空 → pending 退避重读。
                 // CLAUDE BUG-M1：内核防抖允许同 pid 0.1s 内 2 事件 → 去重，
                 // 否则同一 child_pid 进 pending 两次产生重复 Fork。
@@ -340,6 +352,8 @@ impl EventSource for EbpfSource {
             self.initial_scan_done = true;
         }
         self.drain(&mut events);
+        // 启动窗口结束：initial_scanned 仅用于 initial_scan 同轮 drain
+        self.initial_scanned.clear();
         if events.is_empty() {
             // 空轮：休眠至 min(deadline, pending 最早退避时刻)。
             // CLAUDE BUG-M2：否则 100ms 的 pending 退避会被 2s 轮询周期
@@ -394,6 +408,14 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert!(entries.contains(&key("com.tenc")));
         assert!(entries.contains(&key("ncent.mm"))); // 末 8 字节
+    }
+
+    #[test]
+    fn target_entries_exact_eight_bytes_single_key() {
+        // CLAUDE NEW-L3：恰好 8 字节包名 → 只产生前缀键（len > 8 才加后缀）
+        let entries = EbpfSource::target_entries(&["com.test".into()]);
+        assert_eq!(entries.len(), 1, "8 字节包名只应有前缀键");
+        assert_eq!(entries[0], key("com.test"));
     }
 
     #[test]
