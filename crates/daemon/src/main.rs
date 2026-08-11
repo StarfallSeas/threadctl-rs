@@ -3,11 +3,13 @@
 //! P2: Orchestrator main loop (P1 hot-reload + ProcSource event pipeline + relock + cleanup).
 
 mod ebpf_source;
+mod ipc;
 mod proc_source;
 
 use std::env;
 use std::fs;
 use std::process;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -28,9 +30,101 @@ use threadctl_core::topology::BASE_CPUSET;
 use threadctl_core::tracker::StateTracker;
 
 use ebpf_source::EbpfSource;
+use ipc::IpcRequest;
 use proc_source::ProcSource;
 
+/// P7.3 (NEW-L4)：SIGTERM/SIGINT → 主循环优雅退出（正常走 cleanup，不硬杀）。
+static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn handle_shutdown_signal(_: libc::c_int) {
+    SHUTDOWN.store(true, AtomicOrdering::Relaxed);
+}
+
+fn install_signal_handlers() {
+    unsafe {
+        // rustc 新版：函数项先 cast 指针再转 sighandler_t
+        let h = handle_shutdown_signal as *const () as libc::sighandler_t;
+        libc::signal(libc::SIGTERM, h);
+        libc::signal(libc::SIGINT, h);
+    }
+}
+
 /// 单调秒。
+/// P7.3 (C1)：IPC 命令处理（主循环持有 tracker 执行，响应回写）。
+fn handle_ipc(
+    req: &IpcRequest,
+    tracker: &mut StateTracker,
+    cfg: &ConfigSnapshot,
+    topo: &threadctl_core::topology::CpuTopology,
+    backend: &threadctl_core::backend::LinuxV1Backend,
+    store: &ConfigStore,
+    source: &mut dyn EventSource,
+) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    match req {
+        IpcRequest::Status => {
+            let _ = writeln!(out, "== threadctl status ==");
+            let _ = writeln!(out, "version      : {}", env!("CARGO_PKG_VERSION"));
+            let _ = writeln!(out, "config       : v{} ({} pkgs)", cfg.version, cfg.rules.pkgs().len());
+            let tracked = engine::tracked_summary(tracker);
+            let _ = writeln!(out, "tracked      : {} processes / {} threads",
+                tracked.len(), tracked.iter().map(|(_, _, t)| t).sum::<usize>());
+            for (pid, pkg, n) in tracked.iter().take(20) {
+                let _ = writeln!(out, "  {pid:>7}  {pkg:<24} {n} threads");
+            }
+            let a = threadctl_core::audit::summary_windowed(60);
+            let _ = writeln!(out, "audit(60s)   : total={} success={} cgroup_blocked={} downgraded={}",
+                a.total_attempts, a.success, a.blocked_by_cgroup, a.downgraded);
+            let r = engine::relock_stats();
+            let _ = writeln!(out, "relock       : allow={} skip={} degrade={}", r.allow, r.skip, r.degrade);
+        }
+        IpcRequest::Dump(pid) => {
+            match tracker.get(*pid) {
+                Some(st) => {
+                    let _ = writeln!(out, "== pid {} ({}) ==", pid, st.pkg);
+                    let _ = writeln!(out, "  applied_tids : {}", st.applied_tids.len());
+                    let allowed = threadctl_core::topology::CpuSet::read_allowed_mask(*pid)
+                        .map(|m| m.to_range_string()).unwrap_or_else(|| "<read failed>".into());
+                    let _ = writeln!(out, "  allowed_mask : {allowed}");
+                    let cpuset = threadctl_core::relock::read_cpuset_owner(*pid).unwrap_or_else(|| "<none>".into());
+                    let _ = writeln!(out, "  cpuset       : {cpuset}");
+                    let alive = threadctl_core::proc::is_alive(*pid);
+                    let _ = writeln!(out, "  alive        : {alive}");
+                }
+                None => {
+                    let _ = writeln!(out, "pid {pid} 不在跟踪列表（未配置或已退出）");
+                }
+            }
+        }
+        IpcRequest::Reload => {
+            match store.reload() {
+                Ok(v) => {
+                    let _ = writeln!(out, "reload: 配置已重载 (version {v})");
+                    // 与热加载同路径：通知事件源 + 保留白名单 + 全量刷新
+                    let cfg = store.current();
+                    source.on_config_changed(&cfg);
+                    tracker.retain_interested(&pkg_set(&cfg));
+                    let n = engine::relock_all(tracker, &cfg, topo, now_secs(),
+                        &RelockContext { pressure: PressureLevel::Normal, thermal_pressure: 0.0, audit_failure_rate: 0.0 },
+                        &threadctl_core::decision::DecisionEngine::default(), backend);
+                    let _ = writeln!(out, "reload: applied {n} threads");
+                }
+                Err(e) => {
+                    let _ = writeln!(out, "reload 失败: {e}");
+                }
+            }
+        }
+        IpcRequest::Apply(pid) => {
+            let n = engine::relock_all(tracker, cfg, topo, now_secs(),
+                &RelockContext { pressure: PressureLevel::Normal, thermal_pressure: 0.0, audit_failure_rate: 0.0 },
+                &threadctl_core::decision::DecisionEngine::default(), backend);
+            let _ = writeln!(out, "apply {pid}: 全量重应用完成 (applied {n} threads)");
+        }
+    }
+    out
+}
+
 fn now_secs() -> i64 {
     let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
     unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
@@ -57,6 +151,14 @@ fn main() {
 
     let mut config_file = String::from("./threadctl.toml");
     let mut scan_interval: u64 = 2;
+    let mut dry_run = false;
+
+    // P7.3 (C1)：CLI 子命令模式（不启动 daemon，连接运行中的 daemon）
+    if args.len() >= 2 && matches!(args[1].as_str(), "status" | "dump" | "reload" | "apply") {
+        let sock = env::var("TC_SOCKET").unwrap_or_else(|_| "./run/threadctl.sock".into());
+        let cmd = args[1..].join(" ");
+        process::exit(ipc::cli_command(&sock, &cmd));
+    }
 
     let mut i = 1;
     while i < args.len() {
@@ -80,6 +182,9 @@ fn main() {
                         process::exit(1);
                     }
                 }
+            }
+            "-t" | "--dry-run" => {
+                dry_run = true;
             }
             "-v" => {
                 println!("threadctl-rs {}", env!("CARGO_PKG_VERSION"));
@@ -142,6 +247,18 @@ fn main() {
             process::exit(1);
         }
     };
+    let cfg = store.current();
+
+    // P7.3 (C2)：dry-run——解析 + 编译 + 打印规则（不启动 daemon）
+    if dry_run {
+        println!("== dry-run: {config_file} ==");
+        println!("engine: mode={:?} scan={}s lock={}s", cfg.engine.mode, cfg.engine.scan_interval, cfg.engine.lock_interval);
+        for line in cfg.rules.dry_run_lines() {
+            println!("{line}");
+        }
+        println!("== dry-run: 配置有效（{} 包）==", cfg.rules.pkgs().len());
+        process::exit(0);
+    }
 
     let cfg = store.current();
     println!(
@@ -192,6 +309,15 @@ fn main() {
     let mut relock_guard = RelockGuard::new();
     relock_guard.set_cooldown(1000); // D3 即时 relock 冷却 1s（防风暴）
     let mut last_coverage_sample = now_secs();
+
+    // P7.3 (C1)：IPC 控制面（Unix socket + mpsc 回主循环）
+    install_signal_handlers();
+    let (ipc_tx, ipc_rx) = std::sync::mpsc::channel::<(IpcRequest, std::sync::mpsc::Sender<String>)>();
+    let ipc_socket = cfg.daemon.ipc_socket.clone();
+    match ipc::spawn_ipc_server(&ipc_socket, ipc_tx) {
+        Ok(_) => println!("ipc socket: {ipc_socket} (root-only 0750)"),
+        Err(e) => eprintln!("warning: IPC 启动失败 ({ipc_socket}): {e}——CLI status/dump/reload 不可用"),
+    }
     let mut last_audit = now_secs();
     let mut sys_ctx_poller = AdaptivePoller::new();
 
@@ -215,8 +341,18 @@ fn main() {
     println!("threadctl-rs v{} started (P2: proc event pipeline)", env!("CARGO_PKG_VERSION"));
 
     loop {
+        if SHUTDOWN.load(AtomicOrdering::Relaxed) {
+            println!("shutdown signal received, exiting");
+            break;
+        }
         let now = now_secs();
         let cfg = store.current();
+
+        // ── P7.3 (C1)：IPC 请求处理（status/dump/reload/apply）──
+        while let Ok((req, reply_tx)) = ipc_rx.try_recv() {
+            let resp = handle_ipc(&req, &mut lock_tracker(&tracker), &cfg, &topo, &backend, &store, source.as_mut());
+            let _ = reply_tx.send(resp);
+        }
 
         // ── 配置变更：重扫白名单 + 全量刷新 ──
         while let Ok(version) = reload_rx.try_recv() {

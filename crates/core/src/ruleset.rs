@@ -171,6 +171,52 @@ impl RuleSet {
         &self.pkgs
     }
 
+    /// P7.3 (C2)：dry-run 打印——每个包的规则明细（default/thread + 合并后策略）。
+    /// core 内访问 CompiledRule；daemon `-t` 模式调用后直接打印。
+    pub fn dry_run_lines(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for pkg in &self.pkgs {
+            out.push(format!("app \"{pkg}\":"));
+            let rules: Vec<&CompiledRule> = self.rules.iter().filter(|r| r.pkg == *pkg).collect();
+            if rules.is_empty() {
+                out.push("  (无规则——仅白名单占位)".into());
+                continue;
+            }
+            for r in rules {
+                let target = if r.thread.is_empty() {
+                    "default".to_string()
+                } else {
+                    format!("thread {:?}", r.thread)
+                };
+                let mut parts = Vec::new();
+                if !r.policy.cpus.is_empty() {
+                    parts.push(format!("cpus={}", r.policy.cpus.to_range_string()));
+                }
+                if let Some(s) = r.policy.sched {
+                    parts.push(format!("sched={s:?}"));
+                }
+                if let Some(p) = r.policy.sched_prio {
+                    parts.push(format!("prio={p}"));
+                }
+                if let Some(n) = r.policy.nice {
+                    parts.push(format!("nice={n}"));
+                }
+                if let Some(v) = r.policy.uclamp_min {
+                    parts.push(format!("uclamp_min={v}"));
+                }
+                if let Some(v) = r.policy.uclamp_max {
+                    parts.push(format!("uclamp_max={v}"));
+                }
+                if parts.is_empty() {
+                    out.push(format!("  {target}: (无策略——占位)"));
+                } else {
+                    out.push(format!("  {target}: {}", parts.join(", ")));
+                }
+            }
+        }
+        out
+    }
+
     /// 编译配置中的规则列表；无效规则计入 errors 并跳过。
     pub fn compile(configs: &[RuleConfig], topo: &CpuTopology) -> CompileResult {
         let mut rules: Vec<CompiledRule> = Vec::new();
@@ -258,12 +304,32 @@ impl RuleSet {
             }
         }
 
+        // P7.3 (B2)：DVFS 域感知——规则 cpus 跨多个 DVFS 域时提示
+        //（validation/warning 层，不改用户配置——规划书 B2 定界）。
+        for r in &rules {
+            if r.policy.cpus.is_empty() {
+                continue;
+            }
+            let mut domains_hit = 0usize;
+            for d in &topo.dvfs_domains {
+                let mut cp = r.policy.cpus.clone();
+                cp.and(d);
+                if !cp.is_empty() {
+                    domains_hit += 1;
+                }
+            }
+            if domains_hit > 1 {
+                eprintln!(
+                    "warning: rule pkg={:?} cpus={} spans {domains_hit} DVFS domains — 同域同频更稳（仅提示，不改配置）",
+                    r.pkg, r.policy.cpus.to_range_string()
+                );
+            }
+        }
         CompileResult {
             rules: RuleSet { rules, exact, wildcards, pkgs, cache: Mutex::new(HashMap::new()) },
             errors,
         }
     }
-
     /// pkg → 命中规则（**exact 与 wildcard 并存**，GPT 第三次审查：
     /// 来源不互斥，低优先级来源参与字段填充）。
     /// 带实例级缓存：首次扫描，后续 O(1)。
