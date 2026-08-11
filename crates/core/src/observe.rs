@@ -158,6 +158,9 @@ pub struct Sampler {
     interval_secs: u64,
     /// 内核 tick 频率（默认 100；/proc/uptime 无法直接拿 HZ，用 100 近似）
     hz: u64,
+    /// 复用缓冲（性能审查：每轮新建 Vec 导致 RSS 高水位不回落——
+    /// Rust 分配器不把内存还给 OS，峰值保持；复用消除分配 churn）
+    buf: Vec<ThreadSnapshot>,
 }
 
 impl Sampler {
@@ -166,12 +169,14 @@ impl Sampler {
             last_cpu: HashMap::new(),
             interval_secs: interval_secs.max(1),
             hz: 100,
+            buf: Vec::with_capacity(256),
         }
     }
 
-    /// 遍历所有跟踪进程的全部线程，产快照（进程级 affinity 读 /proc/<pid>/cpuset）。
-    pub fn sample(&mut self, tracker: &StateTracker) -> Vec<ThreadSnapshot> {
-        let mut out = Vec::new();
+    /// 遍历所有跟踪进程的全部线程，产快照（复用缓冲，返回借用）。
+    pub fn sample(&mut self, tracker: &StateTracker) -> &[ThreadSnapshot] {
+        self.buf.clear();
+        let out = &mut self.buf;
         for pid in tracker.pids() {
             let Some(st) = tracker.get(pid) else {
                 continue;

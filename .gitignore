@@ -20,3 +20,7 @@ run/
 
 # OS
 .DS_Store
+
+# 本地监测日志
+cpu.log
+monitor.log

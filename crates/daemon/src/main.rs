@@ -457,11 +457,12 @@ fn main() {
             }
         }
 
-        // ── P8：线程观测采样（2s）→ 窗口统计 ──
-        if now - last_observe >= 2 {
+        // ── P8：线程观测采样（5s，性能审查：2s 全量读 600+ /proc 文件是
+        // CPU 2.8% 均值的持续大头；5s 后窗口 150×5=12.5 分钟仍足够）──
+        if now - last_observe >= 5 {
             last_observe = now;
             let snaps = sampler.sample(&lock_tracker(&tracker));
-            snap_window.push_batch(&snaps);
+            snap_window.push_batch(snaps);
         }
 
         // ── 死进程清理 ──
