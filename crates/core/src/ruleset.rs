@@ -306,6 +306,8 @@ impl RuleSet {
 
         // P7.3 (B2)：DVFS 域感知——规则 cpus 跨多个 DVFS 域时提示
         //（validation/warning 层，不改用户配置——规划书 B2 定界）。
+        // 去重：同 pkg+同 cpus 只警告一次（防启动刷屏）。
+        let mut warned: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
         for r in &rules {
             if r.policy.cpus.is_empty() {
                 continue;
@@ -319,10 +321,13 @@ impl RuleSet {
                 }
             }
             if domains_hit > 1 {
-                eprintln!(
-                    "warning: rule pkg={:?} cpus={} spans {domains_hit} DVFS domains — 同域同频更稳（仅提示，不改配置）",
-                    r.pkg, r.policy.cpus.to_range_string()
-                );
+                let key = (r.pkg.clone(), r.policy.cpus.to_range_string());
+                if warned.insert(key.clone()) {
+                    eprintln!(
+                        "warning: rule pkg={:?} cpus={} spans {domains_hit} DVFS domains — 同域同频更稳（仅提示，不改配置）",
+                        key.0, key.1
+                    );
+                }
             }
         }
         CompileResult {

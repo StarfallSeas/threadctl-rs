@@ -312,6 +312,14 @@ fn main() {
 
     // P7.3 (C1)：IPC 控制面（Unix socket + mpsc 回主循环）
     install_signal_handlers();
+    // 部署修复：run/ 等父目录可能不存在（新目录部署）——自动创建，
+    // 否则 IPC socket 与 pid-file 都绑定失败
+    if let Some(parent) = std::path::Path::new(&cfg.daemon.ipc_socket).parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if let Some(parent) = std::path::Path::new(&cfg.daemon.pid_file).parent() {
+        let _ = fs::create_dir_all(parent);
+    }
     let (ipc_tx, ipc_rx) = std::sync::mpsc::channel::<(IpcRequest, std::sync::mpsc::Sender<String>)>();
     let ipc_socket = cfg.daemon.ipc_socket.clone();
     match ipc::spawn_ipc_server(&ipc_socket, ipc_tx) {
