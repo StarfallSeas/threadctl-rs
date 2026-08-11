@@ -9,6 +9,7 @@ mod proc_source;
 use std::env;
 use std::fs;
 use std::process;
+use std::thread;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -477,6 +478,14 @@ fn main() {
         let poll_interval = scan_interval.max(cfg.engine.scan_interval);
         let deadline = Instant::now() + Duration::from_secs(poll_interval);
         let events = source.poll(deadline);
+        // ── CPU 保护（性能审查发现）：事件源 poll 是立即返回的（eBPF drain
+        // 不阻塞，deadline 被忽略）→ 主循环无等待会高速空转（实测 38% CPU）。
+        // 睡到 deadline 剩余（上限 100ms——fork 应用延迟 ≤100ms 仍 near-real-time，
+        // 空转频率 10Hz，CPU <1%）。
+        let remain = deadline.saturating_duration_since(Instant::now());
+        if !remain.is_zero() {
+            thread::sleep(remain.min(Duration::from_millis(100)));
+        }
         if !events.is_empty() {
             let n = engine::handle_events(&mut lock_tracker(&tracker), &events, &cfg, &topo, now, &backend);
             if n > 0 {
