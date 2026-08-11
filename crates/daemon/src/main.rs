@@ -50,6 +50,24 @@ fn install_signal_handlers() {
 }
 
 /// 单调秒。
+/// P7.3 (CLAUDE BUG-M1)：配置重载公共路径——热加载线程与 IPC reload 命令
+/// 共用。消除重复逻辑 + 统一使用真实 decision_engine/压力上下文
+///（此前 IPC 路径用 DecisionEngine::default()，决策与主循环不一致）。
+fn do_reload(
+    store: &ConfigStore,
+    source: &mut dyn EventSource,
+    tracker: &mut StateTracker,
+    topo: &threadctl_core::topology::CpuTopology,
+    backend: &threadctl_core::backend::LinuxV1Backend,
+    decision: &threadctl_core::decision::DecisionEngine,
+    rctx: &RelockContext,
+) -> usize {
+    let cfg = store.current();
+    source.on_config_changed(&cfg);
+    tracker.retain_interested(&pkg_set(&cfg));
+    engine::relock_all(tracker, &cfg, topo, now_secs(), rctx, decision, backend)
+}
+
 /// P7.3 (C1)：IPC 命令处理（主循环持有 tracker 执行，响应回写）。
 fn handle_ipc(
     req: &IpcRequest,
@@ -59,6 +77,8 @@ fn handle_ipc(
     backend: &threadctl_core::backend::LinuxV1Backend,
     store: &ConfigStore,
     source: &mut dyn EventSource,
+    decision: &threadctl_core::decision::DecisionEngine,
+    rctx: &RelockContext,
 ) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
@@ -101,13 +121,8 @@ fn handle_ipc(
             match store.reload() {
                 Ok(v) => {
                     let _ = writeln!(out, "reload: 配置已重载 (version {v})");
-                    // 与热加载同路径：通知事件源 + 保留白名单 + 全量刷新
-                    let cfg = store.current();
-                    source.on_config_changed(&cfg);
-                    tracker.retain_interested(&pkg_set(&cfg));
-                    let n = engine::relock_all(tracker, &cfg, topo, now_secs(),
-                        &RelockContext { pressure: PressureLevel::Normal, thermal_pressure: 0.0, audit_failure_rate: 0.0 },
-                        &threadctl_core::decision::DecisionEngine::default(), backend);
+                    // CLAUDE BUG-M1：与热加载共用 do_reload（真实 decision/rctx）
+                    let n = do_reload(store, source, tracker, topo, backend, decision, rctx);
                     let _ = writeln!(out, "reload: applied {n} threads");
                 }
                 Err(e) => {
@@ -116,10 +131,9 @@ fn handle_ipc(
             }
         }
         IpcRequest::Apply(pid) => {
-            let n = engine::relock_all(tracker, cfg, topo, now_secs(),
-                &RelockContext { pressure: PressureLevel::Normal, thermal_pressure: 0.0, audit_failure_rate: 0.0 },
-                &threadctl_core::decision::DecisionEngine::default(), backend);
-            let _ = writeln!(out, "apply {pid}: 全量重应用完成 (applied {n} threads)");
+            let n = engine::relock_all(tracker, cfg, topo, now_secs(), rctx, decision, backend);
+            // CLAUDE BUG-M3：当前版本全量重应用（pid 参数保留用于 P8 单进程精确）
+            let _ = writeln!(out, "apply {pid}: 全量重应用完成 (applied {n} threads)（当前为全量，P8 支持单 pid）");
         }
     }
     out
@@ -358,20 +372,15 @@ fn main() {
 
         // ── P7.3 (C1)：IPC 请求处理（status/dump/reload/apply）──
         while let Ok((req, reply_tx)) = ipc_rx.try_recv() {
-            let resp = handle_ipc(&req, &mut lock_tracker(&tracker), &cfg, &topo, &backend, &store, source.as_mut());
+            let resp = handle_ipc(&req, &mut lock_tracker(&tracker), &cfg, &topo, &backend, &store, source.as_mut(), &decision_engine, &build_relock_ctx(&last_sys));
             let _ = reply_tx.send(resp);
         }
 
-        // ── 配置变更：重扫白名单 + 全量刷新 ──
+        // ── 配置变更：重扫白名单 + 全量刷新（CLAUDE BUG-M1：与 IPC reload 共用 do_reload）──
         while let Ok(version) = reload_rx.try_recv() {
             println!("config hot-reload: version {version}");
-            source.on_config_changed(&cfg);
-            {
-                let mut t = lock_tracker(&tracker);
-                t.retain_interested(&pkg_set(&cfg));
-                let n = engine::relock_all(&mut t, &cfg, &topo, now, &build_relock_ctx(&last_sys), &decision_engine, &backend);
-                println!("config change rescan done: applied {n} threads");
-            }
+            let n = do_reload(&store, source.as_mut(), &mut lock_tracker(&tracker), &topo, &backend, &decision_engine, &build_relock_ctx(&last_sys));
+            println!("config change rescan done: applied {n} threads");
         }
 
         // ── P7.2 B1/D3：覆盖采样 → 自适应周期 + 即时 relock（对抗 AMS 覆盖）──

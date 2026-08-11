@@ -34,13 +34,11 @@ pub fn is_in_our_cpuset(pid: i32, base: &str) -> bool {
 }
 
 /// 归属字符串匹配（单测用：不依赖 /proc）。
-/// 路径边界：`rel` 本身或 `rel/` 前缀（避免 `/threadctl2` 误判）。
+/// 路径边界：仅匹配子目录（`rel/` 前缀）——进程在 `/threadctl` 根本身
+/// （非策略子目录）不算"我们的"（CLAUDE LOW-3）。
 fn owner_is_ours(owner: &str, base: &str) -> bool {
     let rel = base.trim_start_matches("/dev/cpuset");
-    owner == base
-        || owner.starts_with(&format!("{base}/"))
-        || owner == rel
-        || owner.starts_with(&format!("{rel}/"))
+    owner.starts_with(&format!("{base}/")) || owner.starts_with(&format!("{rel}/"))
 }
 
 /// D3：抽样全部被跟踪进程的 cpuset 归属，返回被覆盖比例（0.0~1.0）。
@@ -200,8 +198,40 @@ impl AdaptiveRelock {
 
     /// 观测（覆盖比例 0.0~1.0）——daemon 采样后用比例判断。
     /// 便于直接喂 `sample_coverage` 的输出。
+    ///
+    /// **CLAUDE BUG-H1 修复**：不能把 ratio 先转 bool 再喂 `observe`——
+    /// 0 < ratio < 0.5（部分覆盖）转 false 后窗口内 covered_n==0，被误判
+    /// "稳定"而延长周期到 300s（AMS 低强度持续覆盖时对抗强度反向降低）。
+    /// 独立实现：稳定判定要求**当前采样 ratio == 0.0**；任何非零覆盖都重置
+    /// 稳定计时（不缩也不延）。
     pub fn observe_ratio(&mut self, ratio: f64) {
-        self.observe(ratio >= COVER_RATIO_SHRINK);
+        let majority = ratio >= COVER_RATIO_SHRINK;
+        self.samples.push_back(majority);
+        if self.samples.len() > WINDOW_SAMPLES {
+            self.samples.pop_front();
+        }
+        if self.samples.len() < WINDOW_SAMPLES {
+            return;
+        }
+        let covered_n = self.samples.iter().filter(|&&c| c).count();
+        let window_ratio = covered_n as f64 / self.samples.len() as f64;
+
+        if window_ratio >= COVER_RATIO_SHRINK {
+            self.stable_secs = 0;
+            self.rank = self.rank.saturating_sub(1);
+        } else if ratio == 0.0 {
+            // 关键：当前采样零覆盖才累计稳定（0<ratio<0.5 会走 else 重置）
+            self.stable_secs += SAMPLE_INTERVAL_SECS;
+            if self.stable_secs >= STABLE_SECS_EXTEND {
+                self.stable_secs = 0;
+                if self.rank < INTERVALS_SECS.len() - 1 {
+                    self.rank += 1;
+                }
+            }
+        } else {
+            // 任何非零覆盖（即使 <50%）重置稳定计时——不延长周期
+            self.stable_secs = 0;
+        }
     }
 }
 
@@ -234,6 +264,9 @@ mod tests {
         assert!(!owner_is_ours("/top-app", "/dev/cpuset/threadctl"), "系统 cpuset 不算我们的");
         assert!(!owner_is_ours("/background", "/dev/cpuset/threadctl"));
         assert!(!owner_is_ours("/threadctl2/x", "/dev/cpuset/threadctl"), "前缀近似不误判");
+        // CLAUDE LOW-3：根 cgroup 本身（非策略子目录）不算我们的
+        assert!(!owner_is_ours("/threadctl", "/dev/cpuset/threadctl"), "根路径不算我们的");
+        assert!(!owner_is_ours("/dev/cpuset/threadctl", "/dev/cpuset/threadctl"), "完整根路径同理");
     }
 
     #[test]
@@ -271,7 +304,7 @@ mod tests {
     #[test]
     fn adaptive_window_not_full_no_adjust() {
         let mut a = AdaptiveRelock::new();
-        // 窗口未满（<6 采样）→ 持续覆盖也不调整
+        // 窗口未满（<15 采样，30s）→ 持续覆盖也不调整
         for _ in 0..3 {
             a.observe(true);
         }
@@ -341,5 +374,27 @@ mod tests {
             a.observe_ratio(0.8); // 80% 覆盖
         }
         assert_eq!(a.interval_secs(), 10);
+    }
+
+    #[test]
+    fn sub_threshold_coverage_does_not_extend() {
+        // CLAUDE BUG-H1 回归：30% 持续覆盖——不缩短也不延长（稳定计时被
+        // 非零覆盖重置；修复前 window_ratio=0 误判稳定延长到 300s）。
+        let mut a = AdaptiveRelock::new();
+        for _ in 0..60 {
+            a.observe_ratio(0.3); // < 0.5 but > 0
+        }
+        assert_eq!(a.interval_secs(), 60, "sub-threshold coverage must not extend interval");
+    }
+
+    #[test]
+    fn zero_ratio_extends_normally() {
+        // ratio=0（真正稳定）→ 延长路径不受影响
+        let mut a = AdaptiveRelock::from_initial(10);
+        // 满窗口（15 次）+ 60s 稳定（30 次 × 2s）→ 10 → 60
+        for _ in 0..45 {
+            a.observe_ratio(0.0);
+        }
+        assert_eq!(a.interval_secs(), 60, "零覆盖稳定 60s 延长一级");
     }
 }
