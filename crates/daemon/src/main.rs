@@ -27,6 +27,7 @@ use threadctl_core::system_context::{AdaptivePoller, PressureLevel, SystemContex
 use threadctl_core::topology::init_cpu_topo;
 use threadctl_core::relock::{sample_coverage, AdaptiveRelock, RelockGuard, SAMPLE_INTERVAL_SECS};
 use threadctl_core::topology::BASE_CPUSET;
+use threadctl_core::observe::{Sampler, SnapshotWindow};
 use threadctl_core::tracker::StateTracker;
 
 use ebpf_source::EbpfSource;
@@ -79,6 +80,7 @@ fn handle_ipc(
     source: &mut dyn EventSource,
     decision: &threadctl_core::decision::DecisionEngine,
     rctx: &RelockContext,
+    window: &SnapshotWindow,
 ) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
@@ -135,6 +137,37 @@ fn handle_ipc(
             // CLAUDE BUG-M3：当前版本全量重应用（pid 参数保留用于 P8 单进程精确）
             let _ = writeln!(out, "apply {pid}: 全量重应用完成 (applied {n} threads)（当前为全量，P8 支持单 pid）");
         }
+        IpcRequest::Snapshot(filter) => {
+            // P8：线程观测——"0-7[4]" 展示：affinity + [当前运行核]
+            let _ = writeln!(out, "== threadctl snapshot (窗口统计) ==");
+            let _ = writeln!(out, "{:>8}  {:<20} {:>8} {:>4} {:>5} {:>4} {:>6} {:>6}  {}", "tid", "name", "affinity", "cur", "avg%", "max%", "migr", "affChg", "primary");
+            for st in window.stats() {
+                if let Some(pid) = filter {
+                    // 过滤：pid 匹配该线程所属进程（window 只存 tid——查 tracker 归属）
+                    let owned = tracker.get(*pid).map(|p| p.applied_tids.contains(&st.tid)).unwrap_or(false);
+                    if !owned {
+                        continue;
+                    }
+                }
+                let (cur_cpu, cur_aff) = window
+                    .recent_sample(st.tid)
+                    .map(|(cpu, aff)| (cpu.map(|c| c.to_string()).unwrap_or_else(|| "-".into()), aff))
+                    .unwrap_or(("-".into(), "-".into()));
+                let _ = writeln!(
+                    out,
+                    "{:>8}  {:<20} {:>8} {:>4} {:>5} {:>4} {:>6} {:>6}  {}",
+                    st.tid,
+                    st.name.chars().take(20).collect::<String>(),
+                    cur_aff,
+                    cur_cpu,
+                    st.avg_load_pct,
+                    st.max_load_pct,
+                    st.migrations,
+                    st.affinity_changes,
+                    st.primary_cpu.map(|c| c.to_string()).unwrap_or_else(|| "-".into()),
+                );
+            }
+        }
     }
     out
 }
@@ -168,7 +201,7 @@ fn main() {
     let mut dry_run = false;
 
     // P7.3 (C1)：CLI 子命令模式（不启动 daemon，连接运行中的 daemon）
-    if args.len() >= 2 && matches!(args[1].as_str(), "status" | "dump" | "reload" | "apply") {
+    if args.len() >= 2 && matches!(args[1].as_str(), "status" | "dump" | "reload" | "apply" | "snapshot") {
         let sock = env::var("TC_SOCKET").unwrap_or_else(|_| "./run/threadctl.sock".into());
         let cmd = args[1..].join(" ");
         process::exit(ipc::cli_command(&sock, &cmd));
@@ -324,6 +357,11 @@ fn main() {
     relock_guard.set_cooldown(1000); // D3 即时 relock 冷却 1s（防风暴）
     let mut last_coverage_sample = now_secs();
 
+    // P8：观测数据层——周期采样（2s）→ 窗口统计（迁移/分布）
+    let mut sampler = Sampler::new(2);
+    let mut snap_window = SnapshotWindow::new();
+    let mut last_observe = now_secs();
+
     // P7.3 (C1)：IPC 控制面（Unix socket + mpsc 回主循环）
     install_signal_handlers();
     // 部署修复：run/ 等父目录可能不存在（新目录部署）——自动创建，
@@ -372,7 +410,7 @@ fn main() {
 
         // ── P7.3 (C1)：IPC 请求处理（status/dump/reload/apply）──
         while let Ok((req, reply_tx)) = ipc_rx.try_recv() {
-            let resp = handle_ipc(&req, &mut lock_tracker(&tracker), &cfg, &topo, &backend, &store, source.as_mut(), &decision_engine, &build_relock_ctx(&last_sys));
+            let resp = handle_ipc(&req, &mut lock_tracker(&tracker), &cfg, &topo, &backend, &store, source.as_mut(), &decision_engine, &build_relock_ctx(&last_sys), &snap_window);
             let _ = reply_tx.send(resp);
         }
 
@@ -416,6 +454,13 @@ fn main() {
                     }
                 }
             }
+        }
+
+        // ── P8：线程观测采样（2s）→ 窗口统计 ──
+        if now - last_observe >= 2 {
+            last_observe = now;
+            let snaps = sampler.sample(&lock_tracker(&tracker));
+            snap_window.push_batch(&snaps);
         }
 
         // ── 死进程清理 ──

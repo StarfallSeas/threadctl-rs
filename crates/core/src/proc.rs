@@ -83,6 +83,29 @@ pub fn read_tgid(pid: i32) -> Option<i32> {
     })
 }
 
+/// 解析 `/proc/<tid>/stat`（`)` 后字段）。
+/// 返回字段数组（[0]=state … [10]=utime, [11]=stime, [36]=processor）。
+pub(crate) fn parse_stat_fields(stat: &str) -> Option<Vec<&str>> {
+    let after = stat.rsplit_once(')')?.1;
+    Some(after.trim().split_whitespace().collect())
+}
+
+/// P8：线程实际运行核心（/proc/<tid>/stat 第 39 字段，数组索引 36）。
+/// 对应 Metric 需求"线程快照含实际运行核心"——"0-7[4]" 的 [4] 部分。
+pub fn read_processor(tid: i32) -> Option<u32> {
+    let stat = fs::read_to_string(format!("/proc/{tid}/stat")).ok()?;
+    parse_stat_fields(&stat)?.get(36)?.parse().ok()
+}
+
+/// P8：线程累计 CPU 时间（utime+stime，tick）——负载采样用（相邻两次差 / 间隔）。
+pub fn read_thread_cpu_secs(tid: i32) -> Option<u64> {
+    let stat = fs::read_to_string(format!("/proc/{tid}/stat")).ok()?;
+    let f = parse_stat_fields(&stat)?;
+    let utime: u64 = f.get(10)?.parse().ok()?;
+    let stime: u64 = f.get(11)?.parse().ok()?;
+    Some(utime + stime)
+}
+
 /// Process liveness (Claude DESIGN-3: kill(pid,0) may return EPERM under
 /// SELinux restrictions for an alive process — EPERM means "exists but no
 /// signal permission", must be treated as alive, otherwise running processes

@@ -21,6 +21,8 @@ pub enum IpcRequest {
     Dump(i32),
     Reload,
     Apply(i32),
+    /// P8：线程观测快照（可选 pid 过滤）。
+    Snapshot(Option<i32>),
 }
 
 /// 启动 IPC 监听线程。返回 (请求 rx 给主循环, 线程句柄)。
@@ -77,6 +79,9 @@ fn parse_request(line: &str) -> IpcRequest {
             .and_then(|p| p.parse::<i32>().ok())
             .map(IpcRequest::Apply)
             .unwrap_or(IpcRequest::Status),
+        Some("snapshot") => IpcRequest::Snapshot(
+            parts.next().and_then(|p| p.parse::<i32>().ok()),
+        ),
         _ => IpcRequest::Status, // 未知命令 → status（不执行任意命令）
     }
 }
@@ -132,6 +137,15 @@ mod tests {
         match parse_request("apply 5678") {
             IpcRequest::Apply(pid) => assert_eq!(pid, 5678),
             _ => panic!("apply 解析错误"),
+        }
+    }
+
+    #[test]
+    fn parse_snapshot() {
+        assert!(matches!(parse_request("snapshot"), IpcRequest::Snapshot(None)));
+        match parse_request("snapshot 1234") {
+            IpcRequest::Snapshot(Some(pid)) => assert_eq!(pid, 1234),
+            _ => panic!("snapshot pid 解析错误"),
         }
     }
 

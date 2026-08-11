@@ -24,6 +24,7 @@ pub mod foreground;
 #[cfg(feature = "kdl")]
 pub mod kdl_parser;
 pub mod merge;
+pub mod observe;
 pub mod policy;
 pub mod proc;
 pub mod profile;
