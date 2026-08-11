@@ -24,8 +24,23 @@ pub fn read_cpuset_owner(pid: i32) -> Option<String> {
 
 /// 进程是否仍在我们创建的 cpuset 下（D3 覆盖检测）。
 /// `base` 即 `/dev/cpuset/threadctl`（topology::BASE_CPUSET）。
+///
+/// **注意**：`/proc/<pid>/cpuset` 返回**挂载点相对路径**（如 `/threadctl/3-7`），
+/// 不是完整路径 `/dev/cpuset/threadctl/3-7`——`starts_with(base)` 永远 false
+/// 导致 coverage 恒 100%（P7.2.1 真机 bug，adaptive 被误拉到 3s 下限）。
+/// 兼容两种形式：完整前缀或挂载相对前缀。
 pub fn is_in_our_cpuset(pid: i32, base: &str) -> bool {
-    read_cpuset_owner(pid).is_some_and(|owner| owner.starts_with(base))
+    read_cpuset_owner(pid).is_some_and(|owner| owner_is_ours(&owner, base))
+}
+
+/// 归属字符串匹配（单测用：不依赖 /proc）。
+/// 路径边界：`rel` 本身或 `rel/` 前缀（避免 `/threadctl2` 误判）。
+fn owner_is_ours(owner: &str, base: &str) -> bool {
+    let rel = base.trim_start_matches("/dev/cpuset");
+    owner == base
+        || owner.starts_with(&format!("{base}/"))
+        || owner == rel
+        || owner.starts_with(&format!("{rel}/"))
 }
 
 /// D3：抽样全部被跟踪进程的 cpuset 归属，返回被覆盖比例（0.0~1.0）。
@@ -99,10 +114,11 @@ impl Default for RelockGuard {
 pub const INTERVALS_SECS: [u64; 4] = [3, 10, 60, 300];
 pub const DEFAULT_INTERVAL: u64 = 60;
 
-/// 覆盖采样周期（daemon 调用 observe 的节奏）。
-pub const SAMPLE_INTERVAL_SECS: u64 = 5;
-/// 观察窗口 ≥30s（规划书要求）→ 6 个采样。
-pub const WINDOW_SAMPLES: usize = 6;
+/// 覆盖采样周期（daemon 调用 observe 的节奏）。P7.2 后从 5s 缩到 2s——
+/// D3 覆盖拉回延迟 5s→2s（每轮读跟踪进程 cpuset 微秒级，功耗可忽略）。
+pub const SAMPLE_INTERVAL_SECS: u64 = 2;
+/// 观察窗口 ≥30s（规划书要求）→ 2s 采样 × 15 个。
+pub const WINDOW_SAMPLES: usize = 15;
 /// 窗口内覆盖比例 ≥ 此值 → 缩短一级。
 const COVER_RATIO_SHRINK: f64 = 0.5;
 /// 连续无覆盖时长 ≥ 此值（秒）→ 延长一级。
@@ -202,6 +218,25 @@ mod tests {
     // ── RelockGuard ──
 
     #[test]
+    fn owner_is_ours_mount_relative() {
+        // P7.2.1 真机 bug：/proc/<pid>/cpuset 返回挂载相对路径
+        assert!(owner_is_ours("/threadctl/3-7", "/dev/cpuset/threadctl"), "挂载相对路径必须命中");
+        assert!(owner_is_ours("/threadctl/0-5", "/dev/cpuset/threadctl"));
+    }
+
+    #[test]
+    fn owner_is_ours_full_path() {
+        assert!(owner_is_ours("/dev/cpuset/threadctl/3-7", "/dev/cpuset/threadctl"), "完整路径兼容");
+    }
+
+    #[test]
+    fn owner_is_ours_foreign() {
+        assert!(!owner_is_ours("/top-app", "/dev/cpuset/threadctl"), "系统 cpuset 不算我们的");
+        assert!(!owner_is_ours("/background", "/dev/cpuset/threadctl"));
+        assert!(!owner_is_ours("/threadctl2/x", "/dev/cpuset/threadctl"), "前缀近似不误判");
+    }
+
+    #[test]
     fn guard_first_call_passes() {
         let mut g = RelockGuard::new();
         assert!(g.try_lock(Instant::now()), "初始无冷却应放行");
@@ -246,16 +281,16 @@ mod tests {
     #[test]
     fn adaptive_sustained_coverage_shrinks_to_3s() {
         let mut a = AdaptiveRelock::new();
-        // 窗口满 + 持续覆盖 → 60 → 10 → 3
-        for _ in 0..6 {
+        // 窗口满（15 采样）+ 持续覆盖 → 60 → 10 → 3
+        for _ in 0..15 {
             a.observe(true);
         }
         assert_eq!(a.interval_secs(), 10, "第一轮持续覆盖缩短到 10s");
-        for _ in 0..6 {
+        for _ in 0..15 {
             a.observe(true);
         }
         assert_eq!(a.interval_secs(), 3, "第二轮持续覆盖到 3s 下限");
-        for _ in 0..6 {
+        for _ in 0..15 {
             a.observe(true);
         }
         assert_eq!(a.interval_secs(), 3, "已在下限不再缩短");
@@ -264,8 +299,8 @@ mod tests {
     #[test]
     fn adaptive_single_coverage_no_adjust() {
         let mut a = AdaptiveRelock::new();
-        // 窗口内 1/6 覆盖（<50%）→ 不缩短；且重置稳定累计
-        for _ in 0..5 {
+        // 窗口内 1/15 覆盖（<50%）→ 不缩短；且重置稳定累计
+        for _ in 0..14 {
             a.observe(false);
         }
         a.observe(true);
@@ -275,26 +310,25 @@ mod tests {
     #[test]
     fn adaptive_stable_extends_to_300s() {
         let mut a = AdaptiveRelock::new();
-        // 先缩短到 3s
-        for _ in 0..12 {
+        // 先缩短到 3s（15+15+15 持续覆盖）
+        for _ in 0..45 {
             a.observe(true);
         }
         assert_eq!(a.interval_secs(), 3);
-        // 清空窗口（6 次 false 把旧 true 挤出）+ 稳定 60s（12 次）→ 3 → 10
-        // 注意：混合窗口（新旧 true 并存）会重置 stable_secs——设计行为
-        for _ in 0..18 {
+        // 清空窗口（15 次 false 挤出旧 true）+ 稳定 60s（30 次 × 2s）→ 3 → 10
+        for _ in 0..45 {
             a.observe(false);
         }
         assert_eq!(a.interval_secs(), 10, "清窗+稳定 60s 延长一级");
-        for _ in 0..12 {
+        for _ in 0..30 {
             a.observe(false);
         }
         assert_eq!(a.interval_secs(), 60, "再稳定 60s 回到 60");
-        for _ in 0..12 {
+        for _ in 0..30 {
             a.observe(false);
         }
         assert_eq!(a.interval_secs(), 300, "最终到 300s 上限");
-        for _ in 0..12 {
+        for _ in 0..30 {
             a.observe(false);
         }
         assert_eq!(a.interval_secs(), 300, "已在上限不再延长");
@@ -303,7 +337,7 @@ mod tests {
     #[test]
     fn adaptive_ratio_api() {
         let mut a = AdaptiveRelock::new();
-        for _ in 0..6 {
+        for _ in 0..15 {
             a.observe_ratio(0.8); // 80% 覆盖
         }
         assert_eq!(a.interval_secs(), 10);
