@@ -141,6 +141,13 @@ impl SnapshotWindow {
     pub fn recent_sample(&self, tid: i32) -> Option<(Option<u32>, String)> {
         self.recent.get(&tid)?.back().map(|(_, cpu, aff)| (*cpu, aff.clone()))
     }
+
+    /// 清理已退出线程的统计（审查发现：stats 只增不减——长期运行旧 tid 累积泄漏）。
+    /// daemon 与 cleanup_dead 同周期调用（收集存活 tid 集合传入）。
+    pub fn retain(&mut self, alive_tids: &std::collections::HashSet<i32>) {
+        self.recent.retain(|tid, _| alive_tids.contains(tid));
+        self.stats.retain(|tid, _| alive_tids.contains(tid));
+    }
 }
 
 impl Default for SnapshotWindow {

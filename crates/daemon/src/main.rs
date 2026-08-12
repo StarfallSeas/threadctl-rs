@@ -473,6 +473,18 @@ fn main() {
             if removed > 0 {
                 println!("dead process cleanup: {removed}");
             }
+            // 审查修复：快照窗口同步清理已退出线程（stats 只增不减会泄漏；
+            // 线程退出但进程存活时不触发 removed>0，故每次 cleanup 都同步）
+            let mut alive = std::collections::HashSet::new();
+            {
+                let t = lock_tracker(&tracker);
+                for pid in t.pids() {
+                    if let Some(st) = t.get(pid) {
+                        alive.extend(st.applied_tids.iter().copied());
+                    }
+                }
+            }
+            snap_window.retain(&alive);
         }
 
         // ── 事件轮询 ──

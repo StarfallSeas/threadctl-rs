@@ -118,27 +118,43 @@ impl StateTracker {
     /// H4 修复：已跟踪且 pkg 相同 → 零 I/O 快速返回（不再每轮读 /proc/<pid>/stat）。
     /// pkg 不同时读 start_time 做 PID 复用检测，并顺带更新 pkg（exec 后包名变化）。
     pub fn enter(&mut self, pid: i32, pkg: String, now: i64) -> &mut ProcessState {
-        if let Some(existing) = self.procs.get(&pid) {
-            if existing.pkg != pkg && existing.start_time != 0 {
-                // pkg 变化：可能是 exec（start_time 不变）或 PID 复用（start_time 变）
-                let st = read_start_time(pid).unwrap_or(0);
-                if st > 0 && st != existing.start_time {
-                    // PID 复用：旧进程已退出，释放旧状态（含 cpuset 引用）
-                    self.remove(pid);
-                } else {
-                    // 同一进程：更新 pkg
-                    let existing = self.procs.get_mut(&pid).unwrap();
-                    existing.pkg = pkg;
-                    return existing;
-                }
+        // 审查重构：先只读判断分支，再操作——避免持可变引用时替换
+        //（原实现三处 get_mut().unwrap()，借用/维护均脆弱）。
+        // 0=fast 返回现有；1=exec 更新 pkg；2=PID 复用需替换；None=新进程。
+        let action = self.procs.get(&pid).map(|ex| {
+            if ex.pkg == pkg || ex.start_time == 0 {
+                0u8
             } else {
-                return self.procs.get_mut(&pid).unwrap();
+                let st = read_start_time(pid).unwrap_or(0);
+                if st == 0 || st == ex.start_time {
+                    1u8
+                } else {
+                    2u8
+                }
             }
+        });
+        match action {
+            Some(0) => self.procs.get_mut(&pid).expect("存在"),
+            Some(1) => {
+                let ex = self.procs.get_mut(&pid).expect("存在");
+                ex.pkg = pkg;
+                ex
+            }
+            Some(2) => {
+                // PID 复用：旧进程已退出——走统一释放路径（cpuset 引用）
+                let (_, old) = self.procs.remove_entry(&pid).expect("存在");
+                self.release_state(&old);
+                let st = read_start_time(pid).unwrap_or(0);
+                self.procs.insert(pid, ProcessState::new(pid, st, pkg, now));
+                self.procs.get_mut(&pid).expect("刚插入")
+            }
+            None => {
+                let st = read_start_time(pid).unwrap_or(0);
+                self.procs.insert(pid, ProcessState::new(pid, st, pkg, now));
+                self.procs.get_mut(&pid).expect("刚插入")
+            }
+            Some(_) => unreachable!("enter 分支常量仅 0/1/2"),
         }
-        let st = read_start_time(pid).unwrap_or(0);
-        self.procs
-            .insert(pid, ProcessState::new(pid, st, pkg, now));
-        self.procs.get_mut(&pid).unwrap()
     }
 
     /// 线程退出（P7.1 IMPL-4）：从 applied_tids 移除单个 tid——消除 TID
@@ -155,6 +171,12 @@ impl StateTracker {
         let Some(state) = self.procs.remove(&pid) else {
             return false;
         };
+        self.release_state(&state);
+        true
+    }
+
+    /// cpuset 引用释放（remove 与 PID 复用替换共用）。
+    fn release_state(&mut self, state: &ProcessState) {
         for dir in &state.applied_dirs {
             if dir.is_empty() {
                 continue;
@@ -176,7 +198,6 @@ impl StateTracker {
                 }
             }
         }
-        true
     }
 
     /// 登记进程新用到的 cpuset 目录（幂等：同目录只计一次）。

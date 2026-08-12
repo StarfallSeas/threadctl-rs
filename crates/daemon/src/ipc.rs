@@ -9,7 +9,7 @@
 //!
 //! 安全：socket 文件 0750 root-only；命令白名单（不做任意命令执行）。
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
 use std::sync::mpsc::Sender;
@@ -43,9 +43,15 @@ pub fn spawn_ipc_server(
                 continue;
             };
             // 单连接串行处理（CLI 低频；status/dump 秒级响应）
-            let mut reader = BufReader::new(stream.try_clone().expect("socket clone"));
+            // 审查修复：try_clone 失败不再 panic（fd 耗尽时监听线程存活）
+            let Ok(clone) = stream.try_clone() else {
+                continue;
+            };
+            let reader = BufReader::new(clone);
             let mut line = String::new();
-            if reader.read_line(&mut line).unwrap_or(0) == 0 {
+            // 行长度上限 4096——防御异常客户端撑爆内存（socket 虽 0750 root-only）
+            let mut limited = reader.take(4096);
+            if limited.read_line(&mut line).unwrap_or(0) == 0 {
                 continue;
             }
             let line = line.trim();
@@ -102,7 +108,6 @@ pub fn cli_command(socket_path: &str, cmd: &str) -> i32 {
     }
     let _ = stream.flush();
     let mut resp = String::new();
-    use std::io::Read;
     if stream.read_to_string(&mut resp).is_ok() {
         print!("{resp}");
     }
