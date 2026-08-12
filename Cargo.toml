@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/daemon", "crates/ebpf"]
+members = ["crates/core", "crates/daemon", "crates/ebpf", "crates/libthreadctl"]
 
 [workspace.package]
 version = "2.0.0-dev"

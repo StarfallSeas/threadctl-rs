@@ -138,7 +138,8 @@ pub fn apply_thread(
 
     if let Some(pol) = policy.sched {
         if pol.is_rt() && !rt_allowed {
-            eprintln!("warning: tid={tid} needs RT scheduling but lacks CAP_SYS_NICE; sched skipped");
+            eprintln!("{}", crate::i18n::t(format!("警告: tid={tid} 需要 RT 调度但缺少 CAP_SYS_NICE；sched 已跳过").as_str(),
+                    format!("warning: tid={tid} needs RT scheduling but lacks CAP_SYS_NICE; sched skipped").as_str()));
             return outcome;
         }
         // NEW-M1: sched 失败（ESRCH/EPERM/EINVAL）不再静默——合并进 outcome
@@ -168,7 +169,8 @@ fn uclamp_supported() -> bool {
             .map(|max| max > 0)
             .unwrap_or(false);
         if !supported {
-            eprintln!("warning: uclamp unsupported (kernel lacks CONFIG_UCLAMP_TASK); uclamp fields will be ignored");
+            eprintln!("{}", crate::i18n::t("警告: 内核不支持 uclamp（缺 CONFIG_UCLAMP_TASK）；uclamp 字段将被忽略",
+                    "warning: uclamp unsupported (kernel lacks CONFIG_UCLAMP_TASK); uclamp fields will be ignored"));
         }
         supported
     })
@@ -338,7 +340,8 @@ fn apply_affinity(tid: i32, pkg: &str, policy: &Policy, topo: &CpuTopology, back
                     return ApplyOutcome::Exited;
                 }
                 if warn_once(&WARNED_EPERM_TIDS, tid) {
-                    eprintln!("warning: setaffinity(tid={tid}) downgraded path EPERM (errno={errno})");
+                    eprintln!("{}", crate::i18n::t(format!("警告: setaffinity(tid={tid}) 降级路径 EPERM (errno={errno})").as_str(),
+                    format!("warning: setaffinity(tid={tid}) downgraded path EPERM (errno={errno})").as_str()));
                 }
                 audit::record(AuditEntry {
                     timestamp: 0,
@@ -398,7 +401,8 @@ fn apply_affinity(tid: i32, pkg: &str, policy: &Policy, topo: &CpuTopology, back
             if errno == libc::EPERM {
                 // M2 修复：EPERM 去重（非 root 桌面场景避免刷屏）
                 if warn_once(&WARNED_EPERM_TIDS, tid) {
-                    eprintln!("warning: setaffinity(tid={tid}) EPERM (no CAP_SYS_NICE or target restricted)");
+                    eprintln!("{}", crate::i18n::t(format!("警告: setaffinity(tid={tid}) EPERM（无 CAP_SYS_NICE 或目标受限）").as_str(),
+                    format!("warning: setaffinity(tid={tid}) EPERM (no CAP_SYS_NICE or target restricted)").as_str()));
                 }
                 audit::record(AuditEntry {
                     timestamp: 0,

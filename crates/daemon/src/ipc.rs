@@ -23,6 +23,10 @@ pub enum IpcRequest {
     Apply(i32),
     /// P8：线程观测快照（可选 pid 过滤）。
     Snapshot(Option<i32>),
+    /// P12：场景一键套用（game/video/power-save/balanced/default）。
+    ApplyScene(String),
+    /// P14：系统 tuning（tune governor <name> / tune iosched <name>）。
+    Tune(String, String),
 }
 
 /// 启动 IPC 监听线程。返回 (请求 rx 给主循环, 线程句柄)。
@@ -88,6 +92,14 @@ fn parse_request(line: &str) -> IpcRequest {
         Some("snapshot") => IpcRequest::Snapshot(
             parts.next().and_then(|p| p.parse::<i32>().ok()),
         ),
+        Some("apply-scene") => IpcRequest::ApplyScene(
+            parts.next().unwrap_or("").to_string(),
+        ),
+        Some("tune") => {
+            let kind = parts.next().unwrap_or("").to_string();
+            let value = parts.next().unwrap_or("").to_string();
+            IpcRequest::Tune(kind, value)
+        }
         _ => IpcRequest::Status, // 未知命令 → status（不执行任意命令）
     }
 }
@@ -151,6 +163,36 @@ mod tests {
         match parse_request("snapshot 1234") {
             IpcRequest::Snapshot(Some(pid)) => assert_eq!(pid, 1234),
             _ => panic!("snapshot pid 解析错误"),
+        }
+    }
+
+    #[test]
+    fn parse_apply_scene() {
+        match parse_request("apply-scene game") {
+            IpcRequest::ApplyScene(n) => assert_eq!(n, "game"),
+            _ => panic!("apply-scene 解析错误"),
+        }
+        match parse_request("apply-scene") {
+            IpcRequest::ApplyScene(n) => assert_eq!(n, ""),
+            _ => panic!("apply-scene 无参数解析错误"),
+        }
+    }
+
+    #[test]
+    fn parse_tune() {
+        match parse_request("tune governor schedutil") {
+            IpcRequest::Tune(kind, val) => {
+                assert_eq!(kind, "governor");
+                assert_eq!(val, "schedutil");
+            }
+            _ => panic!("tune 解析错误"),
+        }
+        match parse_request("tune iosched mq-deadline") {
+            IpcRequest::Tune(kind, val) => {
+                assert_eq!(kind, "iosched");
+                assert_eq!(val, "mq-deadline");
+            }
+            _ => panic!("tune iosched 解析错误"),
         }
     }
 

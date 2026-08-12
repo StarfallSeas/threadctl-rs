@@ -29,6 +29,8 @@ use threadctl_core::topology::init_cpu_topo;
 use threadctl_core::relock::{sample_coverage, AdaptiveRelock, RelockGuard, SAMPLE_INTERVAL_SECS};
 use threadctl_core::topology::BASE_CPUSET;
 use threadctl_core::observe::{Sampler, SnapshotWindow};
+use threadctl_core::i18n;
+use threadctl_core::debug_log;
 use threadctl_core::tracker::StateTracker;
 
 use ebpf_source::EbpfSource;
@@ -52,6 +54,17 @@ fn install_signal_handlers() {
 }
 
 /// 单调秒。
+/// P9：debug 日志辅助——事件批里的不同包数（调试流信息）。
+fn count_pkgs(events: &[threadctl_core::event::ProcessEvent]) -> usize {
+    let mut seen = std::collections::HashSet::new();
+    for ev in events {
+        if let Some(pkg) = ev.pkg.as_deref() {
+            seen.insert(pkg);
+        }
+    }
+    seen.len()
+}
+
 /// P7.3 (CLAUDE BUG-M1)：配置重载公共路径——热加载线程与 IPC reload 命令
 /// 共用。消除重复逻辑 + 统一使用真实 decision_engine/压力上下文
 ///（此前 IPC 路径用 DecisionEngine::default()，决策与主循环不一致）。
@@ -138,6 +151,64 @@ fn handle_ipc(
             // CLAUDE BUG-M3：当前版本全量重应用（pid 参数保留用于 P8 单进程精确）
             let _ = writeln!(out, "apply {pid}: 全量重应用完成 (applied {n} threads)（当前为全量，P8 支持单 pid）");
         }
+        IpcRequest::ApplyScene(name) => {
+            // P12：场景一键套用——写回配置（标记段）→ 触发 reload
+            let content = match fs::read_to_string(&cfg.config_file) {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = writeln!(out, "{}", i18n::t(format!("场景失败: 读取配置失败 {e}").as_str(),
+                        format!("apply-scene failed: cannot read config {e}").as_str()));
+                    return out;
+                }
+            };
+            match threadctl_core::scene::apply_scene_to_config(&content, name) {
+                Ok(new_content) => {
+                    if let Err(e) = fs::write(&cfg.config_file, new_content) {
+                        let _ = writeln!(out, "{}", i18n::t(format!("场景失败: 写回配置失败 {e}").as_str(),
+                            format!("apply-scene failed: cannot write config {e}").as_str()));
+                        return out;
+                    }
+                    // 触发热重载（与 reload 命令同路径）
+                    match store.reload() {
+                        Ok(v) => {
+                            let n = do_reload(store, source, tracker, topo, backend, decision, rctx);
+                            let _ = writeln!(out, "{}", i18n::t(
+                                format!("场景已应用: {name}（配置版本 {v}，重应用 {n} 线程）").as_str(),
+                                format!("scene applied: {name} (config v{v}, re-applied {n} threads)").as_str()));
+                        }
+                        Err(e) => {
+                            let _ = writeln!(out, "{}", i18n::t(format!("场景写回成功但重载失败: {e}").as_str(),
+                                format!("scene written but reload failed: {e}").as_str()));
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = writeln!(out, "{}", i18n::t(format!("场景失败: {e}").as_str(),
+                        format!("apply-scene failed: {e}").as_str()));
+                }
+            }
+        }
+        IpcRequest::Tune(kind, value) => {
+            let result = match (kind.as_str(), value.as_str()) {
+                ("governor", v) if !v.is_empty() => {
+                    threadctl_core::tune::apply_governor(v).map(|n| format!("{n} CPUs"))
+                }
+                ("iosched", v) if !v.is_empty() => {
+                    threadctl_core::tune::apply_io_scheduler(v).map(|n| format!("{n} devices"))
+                }
+                _ => Err(format!("tune 用法: tune governor <name> | tune iosched <name>")),
+            };
+            match result {
+                Ok(detail) => {
+                    let _ = writeln!(out, "{}", i18n::t(format!("tune {kind} {value}: 已应用（{detail}）").as_str(),
+                        format!("tune {kind} {value}: applied ({detail})").as_str()));
+                }
+                Err(e) => {
+                    let _ = writeln!(out, "{}", i18n::t(format!("tune 失败: {e}").as_str(),
+                        format!("tune failed: {e}").as_str()));
+                }
+            }
+        }
         IpcRequest::Snapshot(filter) => {
             // P8：线程观测——"0-7[4]" 展示：affinity + [当前运行核]
             let _ = writeln!(out, "== threadctl snapshot (窗口统计) ==");
@@ -202,7 +273,7 @@ fn main() {
     let mut dry_run = false;
 
     // P7.3 (C1)：CLI 子命令模式（不启动 daemon，连接运行中的 daemon）
-    if args.len() >= 2 && matches!(args[1].as_str(), "status" | "dump" | "reload" | "apply" | "snapshot") {
+    if args.len() >= 2 && matches!(args[1].as_str(), "status" | "dump" | "reload" | "apply" | "snapshot" | "apply-scene" | "tune") {
         let sock = env::var("TC_SOCKET").unwrap_or_else(|_| "./run/threadctl.sock".into());
         let cmd = args[1..].join(" ");
         process::exit(ipc::cli_command(&sock, &cmd));
@@ -291,7 +362,7 @@ fn main() {
     let store = match ConfigStore::new(&config_file, topo.clone()) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("initial config load failed: {e}");
+            eprintln!("{}", i18n::t(format!("初始配置加载失败: {e}").as_str(), format!("initial config load failed: {e}").as_str()));
             process::exit(1);
         }
     };
@@ -299,12 +370,13 @@ fn main() {
 
     // P7.3 (C2)：dry-run——解析 + 编译 + 打印规则（不启动 daemon）
     if dry_run {
-        println!("== dry-run: {config_file} ==");
+        println!("{}", i18n::t(format!("== dry-run: {config_file} ==").as_str(), format!("== dry-run: {config_file} ==").as_str()));
         println!("engine: mode={:?} scan={}s lock={}s", cfg.engine.mode, cfg.engine.scan_interval, cfg.engine.lock_interval);
         for line in cfg.rules.dry_run_lines() {
             println!("{line}");
         }
-        println!("== dry-run: 配置有效（{} 包）==", cfg.rules.pkgs().len());
+        println!("{}", i18n::t(format!("== dry-run: 配置有效（{} 包）==", cfg.rules.pkgs().len()).as_str(),
+            format!("== dry-run: config valid ({} packages) ==", cfg.rules.pkgs().len()).as_str()));
         process::exit(0);
     }
 
@@ -317,7 +389,8 @@ fn main() {
 
     // Q6：RT 调度权限检查。
     let can_rt = can_rt_sched();
-    println!("RT scheduling: {}", if can_rt { "full" } else { "none (fifo/rr will be skipped)" });
+    println!("{}", i18n::t(if can_rt { "RT 调度: 完整" } else { "RT 调度: 无（fifo/rr 将跳过）" },
+            if can_rt { "RT scheduling: full" } else { "RT scheduling: none (fifo/rr will be skipped)" }));
     if cfg.rules.has_rt_sched() && !can_rt {
         eprintln!("warning: config contains fifo/rr rules but CAP_SYS_NICE is missing; sched fields will be skipped");
     }
@@ -337,11 +410,13 @@ fn main() {
     // 构建产物需把 threadctl-ebpf .bpf.o 与 daemon 放同目录。
     let mut source: Box<dyn EventSource> = match EbpfSource::try_new(tracker.clone(), &cfg) {
         Ok(s) => {
-            println!("event source: ebpf (kernel tracepoints)");
+            println!("{}", i18n::t("eBPF 事件源: 可用（fork/exec/exit tracepoints）",
+                        "eBPF event source: available (fork/exec/exit tracepoints)"));
             Box::new(s)
         }
         Err(e) => {
-            eprintln!("warning: ebpf unavailable ({e}) — falling back to /proc polling");
+            eprintln!("{}", i18n::t(format!("警告: eBPF 不可用（{e}）——降级为 /proc 轮询").as_str(),
+                        format!("warning: eBPF unavailable ({e}) — falling back to /proc polling").as_str()));
             Box::new(ProcSource::new(tracker.clone()))
         }
     };
@@ -362,6 +437,28 @@ fn main() {
     let mut sampler = Sampler::new(2);
     let mut snap_window = SnapshotWindow::new();
     let mut last_observe = now_secs();
+
+    // P14：启动时应用 system 配置（CPU governor / IO 调度器）
+    if let Ok(content) = fs::read_to_string(&config_file) {
+        if let Ok(tuning) = threadctl_core::kdl_parser::parse_system(&content) {
+            if let Some(gov) = &tuning.governor {
+                match threadctl_core::tune::apply_governor(gov) {
+                    Ok(n) => println!("{}", i18n::t(format!("CPU governor: {gov}（已应用 {n} 个 CPU）").as_str(),
+                        format!("CPU governor: {gov} (applied {n} CPUs)").as_str())),
+                    Err(e) => eprintln!("{}", i18n::t(format!("警告: governor 应用失败: {e}").as_str(),
+                        format!("warning: governor apply failed: {e}").as_str())),
+                }
+            }
+            if let Some(io) = &tuning.io_scheduler {
+                match threadctl_core::tune::apply_io_scheduler(io) {
+                    Ok(n) => println!("{}", i18n::t(format!("IO 调度器: {io}（已应用 {n} 个设备）").as_str(),
+                        format!("IO scheduler: {io} (applied {n} devices)").as_str())),
+                    Err(e) => eprintln!("{}", i18n::t(format!("警告: IO 调度器应用失败: {e}").as_str(),
+                        format!("warning: IO scheduler apply failed: {e}").as_str())),
+                }
+            }
+        }
+    }
 
     // P7.3 (C1)：IPC 控制面（Unix socket + mpsc 回主循环）
     install_signal_handlers();
@@ -388,22 +485,24 @@ fn main() {
 
     // 组装 relock 决策上下文（fast: pressure/thermal + slow: audit failure rate）。
     let build_relock_ctx = |last_sys: &Option<SystemContext>| -> RelockContext {
-        let (pressure, thermal) = match last_sys {
-            Some(s) => (s.memory_pressure, s.thermal_pressure),
-            None => (PressureLevel::Normal, 0.0),
+        let (pressure, thermal, freq) = match last_sys {
+            Some(s) => (s.memory_pressure, s.thermal_pressure, s.freq_throttle),
+            None => (PressureLevel::Normal, 0.0, 1.0),
         };
         RelockContext {
             pressure,
             thermal_pressure: thermal,
+            freq_throttle: freq,
             audit_failure_rate: audit::summary_windowed(60).failure_rate(),
         }
     };
 
-    println!("threadctl-rs v{} started (P2: proc event pipeline)", env!("CARGO_PKG_VERSION"));
+    println!("{}", i18n::t(format!("threadctl-rs v{} 已启动（事件管道就绪）", env!("CARGO_PKG_VERSION")).as_str(),
+            format!("threadctl-rs v{} started (event pipeline ready)", env!("CARGO_PKG_VERSION")).as_str()));
 
     loop {
         if SHUTDOWN.load(AtomicOrdering::Relaxed) {
-            println!("shutdown signal received, exiting");
+            println!("{}", i18n::t("收到停止信号，正常退出", "shutdown signal received, exiting"));
             break;
         }
         let now = now_secs();
@@ -417,9 +516,9 @@ fn main() {
 
         // ── 配置变更：重扫白名单 + 全量刷新（CLAUDE BUG-M1：与 IPC reload 共用 do_reload）──
         while let Ok(version) = reload_rx.try_recv() {
-            println!("config hot-reload: version {version}");
+            debug_log!("store", "hot-reload: version {version}");
             let n = do_reload(&store, source.as_mut(), &mut lock_tracker(&tracker), &topo, &backend, &decision_engine, &build_relock_ctx(&last_sys));
-            println!("config change rescan done: applied {n} threads");
+            debug_log!("engine", "config change rescan done: applied {n} threads");
         }
 
         // ── P7.2 B1/D3：覆盖采样 → 自适应周期 + 即时 relock（对抗 AMS 覆盖）──
@@ -430,7 +529,7 @@ fn main() {
             adaptive.observe_ratio(ratio);
             let after = adaptive.interval_secs();
             if after != before {
-                println!("adaptive relock: {}s -> {}s (coverage {:.0}%)", before, after, ratio * 100.0);
+                debug_log!("relock", "adaptive: {}s -> {}s (coverage {:.0}%)", before, after, ratio * 100.0);
             }
             // D3：检测到覆盖 → 不等周期即时 relock（guard 1s 冷却防风暴；
             // 与周期 relock 共享 guard，防 AMS↔threadctl 震荡）
@@ -438,7 +537,7 @@ fn main() {
                 let n = engine::relock_all(&mut lock_tracker(&tracker), &cfg, &topo, now, &build_relock_ctx(&last_sys), &decision_engine, &backend);
                 last_lock = now;
                 if n > 0 {
-                    println!("d3 immediate relock: re-applied {n} threads");
+                    debug_log!("relock", "d3 immediate: re-applied {n} threads");
                 }
             }
         }
@@ -451,7 +550,7 @@ fn main() {
                     let n = engine::relock_all(&mut lock_tracker(&tracker), &cfg, &topo, now, &build_relock_ctx(&last_sys), &decision_engine, &backend);
                     last_lock = now;
                     if n > 0 {
-                        println!("relock: re-applied {n} threads");
+                        debug_log!("relock", "periodic: re-applied {n} threads");
                     }
                 }
             }
@@ -471,7 +570,7 @@ fn main() {
             let removed = engine::cleanup_dead(&mut lock_tracker(&tracker));
             last_cleanup = now;
             if removed > 0 {
-                println!("dead process cleanup: {removed}");
+                debug_log!("engine", "dead process cleanup: {removed}");
             }
             // 审查修复：快照窗口同步清理已退出线程（stats 只增不减会泄漏；
             // 线程退出但进程存活时不触发 removed>0，故每次 cleanup 都同步）
@@ -502,7 +601,7 @@ fn main() {
         if !events.is_empty() {
             let n = engine::handle_events(&mut lock_tracker(&tracker), &events, &cfg, &topo, now, &backend);
             if n > 0 {
-                println!("events: {} , applied {} threads", events.len(), n);
+                debug_log!("engine", "events: {} , applied {} threads (pkg-count={})", events.len(), n, count_pkgs(&events));
             }
         }
 
@@ -510,7 +609,7 @@ fn main() {
         if sys_ctx_poller.should_sample() {
             let ctx = SystemContext::sample();
             if ctx.memory_pressure != threadctl_core::system_context::PressureLevel::Normal {
-                println!("SystemContext: {}", ctx.summary());
+                debug_log!("context", "SystemContext: {}", ctx.summary());
             }
             sys_ctx_poller.sampled(&ctx);
             // P6.2-2：保存快照供 relock 决策（fast 信号）
@@ -528,10 +627,11 @@ fn main() {
 
         // ── M4 接入：审计摘要 + relock 决策统计（60s）──
         if now - last_audit >= 60 {
-            println!("{}", audit::summary_string());
+            debug_log!("audit", "{}", audit::summary_string());
             let rs = engine::relock_stats();
-            println!(
-                "relock decisions: allow={} skip={} degrade={}",
+            debug_log!(
+                "relock",
+                "decisions: allow={} skip={} degrade={}",
                 rs.allow, rs.skip, rs.degrade
             );
             last_audit = now;

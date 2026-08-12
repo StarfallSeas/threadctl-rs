@@ -187,13 +187,14 @@ impl StateTracker {
                     self.cpuset_refs.remove(dir);
                     let path = format!("{BASE_CPUSET}/{dir}");
                     if !remove_cpuset_dir(&path) {
-                        eprintln!("cpuset dir reclaim failed: {path}");
+                        eprintln!("{}", crate::i18n::t(format!("警告: cpuset 目录回收失败: {path}").as_str(),
+                    format!("warning: cpuset dir reclaim failed: {path}").as_str()));
                     } else {
                         // Claude Q3: rmdir 后同步清除 ensure 缓存，否则下次
                         // ensure 被缓存跳过 → cpuset tasks 写入失败
                         // CLAUDE LOW-2：缓存归 backend，直接调（policy.rs 转发层已删）
                         crate::backend::forget_cpuset_dir(dir);
-                        println!("cpuset dir reclaimed: {path}");
+                        crate::debug_log!("tracker", "cpuset dir reclaimed: {path}");
                     }
                 }
             }

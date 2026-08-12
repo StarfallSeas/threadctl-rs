@@ -204,6 +204,8 @@ pub struct DecisionContext {
     pub pressure: PressureLevel,
     /// fast：冷却设备使用率 0.0~1.0
     pub thermal_pressure: f64,
+    /// P10：最低 DVFS 域频率比例 0.0~1.0（1.0=满频；降频视作热压）
+    pub freq_throttle: f64,
     /// fast：是否前台（engine 用 intent==Interactive 近似，pid→uid 映射后续）
     pub foreground: bool,
     /// slow：审计失败率 0.0~1.0（窗口由调用方决定，默认 60s）
@@ -232,7 +234,9 @@ impl DecisionEngine {
             TaskIntent::BackgroundLatencySensitive => {} // 继续评估压力/热/审计
             TaskIntent::Interactive => {}
         }
-        if ctx.thermal_pressure > 0.8 {
+        // P10：降频（freq_throttle 低）视作热压——1.0 - freq_throttle 是"降频程度"
+        let effective_thermal = ctx.thermal_pressure.max(1.0 - ctx.freq_throttle);
+        if effective_thermal > 0.8 {
             return Decision::Degrade { level: DegradeLevel::Relax, reason: Reason::ThermalPressure };
         }
         if ctx.audit_failure_rate > 0.5 {
@@ -258,10 +262,25 @@ mod tests {
         DecisionContext {
             intent,
             pressure: PressureLevel::Normal,
+            freq_throttle: 1.0,
             thermal_pressure: 0.0,
             foreground: intent == TaskIntent::Interactive,
             audit_failure_rate: 0.0,
         }
+    }
+
+    #[test]
+    fn freq_throttle_triggers_degrade() {
+        // P10：严重降频（freq_throttle 低）视作热压 → Degrade
+        let eng = DecisionEngine::default();
+        let mut c = ctx(TaskIntent::Interactive);
+        c.freq_throttle = 0.1; // 最低域频率 10%
+        assert!(matches!(eng.decide_ctx(&c), Decision::Degrade { reason: Reason::ThermalPressure, .. }),
+            "降频 10% 应降级");
+        // 满频 + 无热压 → Allow
+        c.freq_throttle = 1.0;
+        c.thermal_pressure = 0.0;
+        assert!(matches!(eng.decide_ctx(&c), Decision::Allow { .. }), "满频应放行");
     }
 
     #[test]

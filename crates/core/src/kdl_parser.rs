@@ -62,6 +62,30 @@ pub fn parse_kdl(input: &str) -> Result<(ConfigModel, DaemonConfig, EngineConfig
     Ok((ConfigModel { apps }, daemon, engine))
 }
 
+/// P14：解析 KDL 文档的 `system` 节点（CPU governor / IO 调度器）。
+/// 独立于主配置（一次性启动应用 + IPC tune 命令），不进入 ConfigSnapshot。
+pub fn parse_system(input: &str) -> Result<crate::tune::SystemTuning, String> {
+    let doc: kdl::KdlDocument = input.parse().map_err(|e| format!("KDL 语法错误: {e}"))?;
+    let mut tuning = crate::tune::SystemTuning::default();
+    for node in doc.nodes() {
+        if node.name().value() != "system" {
+            continue;
+        }
+        if let Some(children) = node.children() {
+            for child in children.nodes() {
+                let name = child.name().value();
+                let val = child.entries().first().and_then(|e| e.value().as_string());
+                match name {
+                    "governor" => tuning.governor = val.map(|s| s.to_string()),
+                    "io-scheduler" => tuning.io_scheduler = val.map(|s| s.to_string()),
+                    _ => {}
+                }
+            }
+        }
+    }
+    Ok(tuning)
+}
+
 /// M3：解析 daemon 节点：pid-file / ipc-socket / log-level。
 fn parse_daemon(node: &kdl::KdlNode, daemon: &mut DaemonConfig) -> Result<(), String> {
     if let Some(children) = node.children() {

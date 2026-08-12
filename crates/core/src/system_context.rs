@@ -35,6 +35,9 @@ pub struct SystemContext {
     pub thermal_pressure: f64,
     pub battery_pct: Option<u8>,
     pub is_charging: bool,
+    /// P10：最低 DVFS 域频率比例 0.0~1.0（1.0=全满频；低=该域严重降频）。
+    /// 采样自 cpufreq policy 的 scaling_cur_freq/scaling_max_freq 最小值。
+    pub freq_throttle: f64,
     /// 建议的下次采集间隔。
     pub next_poll_interval: Duration,
 }
@@ -47,6 +50,7 @@ impl SystemContext {
         let (battery, charging) = Self::read_battery();
         // Claude 审查 Bug 4：sample() 内一次计算并缓存，决策与日志用同一快照
         let thermal_pressure = Self::thermal_pressure();
+        let freq_throttle = Self::read_freq_throttle();
 
         let next = match mem.0 {
             PressureLevel::Normal => Duration::from_secs(10),
@@ -59,6 +63,7 @@ impl SystemContext {
             memory_avg10: mem.1,
             thermal_zones: thermal,
             thermal_pressure,
+            freq_throttle,
             battery_pct: battery,
             is_charging: charging,
             next_poll_interval: next,
@@ -67,6 +72,37 @@ impl SystemContext {
 
     /// M7 修复：冷却设备使用率（0.0~1.0），替代硬编码温度阈值。
     /// 读 /sys/class/thermal/cooling_device*/cur_state / max_state 取平均。
+    /// P10：枚举 cpufreq policy，取最低频率比例（降频最严重域）。
+    /// 读失败/无 cpufreq → 1.0（无降频信息，不惩罚）。
+    pub fn read_freq_throttle() -> f64 {
+        let mut min = 1.0f64;
+        let mut found = false;
+        let Ok(entries) = std::fs::read_dir("/sys/devices/system/cpu/cpufreq") else {
+            return 1.0;
+        };
+        for e in entries.flatten() {
+            let dir = e.path();
+            let cur = dir.join("scaling_cur_freq");
+            let max = dir.join("scaling_max_freq");
+            let Ok(cur_s) = std::fs::read_to_string(&cur) else { continue };
+            let Ok(max_s) = std::fs::read_to_string(&max) else { continue };
+            let Ok(cur_f) = cur_s.trim().parse::<f64>() else { continue };
+            let Ok(max_f) = max_s.trim().parse::<f64>() else { continue };
+            if max_f > 0.0 {
+                let ratio = (cur_f / max_f).clamp(0.0, 1.0);
+                if ratio < min {
+                    min = ratio;
+                }
+                found = true;
+            }
+        }
+        if found {
+            min
+        } else {
+            1.0
+        }
+    }
+
     pub fn thermal_pressure() -> f64 {
         let mut total = 0.0;
         let mut count = 0u32;
@@ -261,6 +297,7 @@ mod tests {
             memory_avg10: 5.0,
             thermal_zones: vec![],
             thermal_pressure: 0.0,
+            freq_throttle: 1.0,
             battery_pct: Some(80),
             is_charging: false,
             next_poll_interval: Duration::from_secs(10),
@@ -276,6 +313,7 @@ mod tests {
             memory_avg10: 80.0,
             thermal_zones: vec![],
             thermal_pressure: 0.0,
+            freq_throttle: 1.0,
             battery_pct: None,
             is_charging: false,
             next_poll_interval: Duration::from_secs(1), // Critical → 1s

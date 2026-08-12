@@ -261,6 +261,8 @@ pub struct RelockContext {
     pub pressure: crate::system_context::PressureLevel,
     /// fast：冷却设备使用率 0.0~1.0
     pub thermal_pressure: f64,
+    /// P10：最低 DVFS 域频率比例 0.0~1.0（1.0=满频）
+    pub freq_throttle: f64,
     /// slow：审计失败率 0.0~1.0（summary_windowed(60)）
     pub audit_failure_rate: f64,
 }
@@ -325,6 +327,7 @@ pub fn relock_all(
             intent,
             pressure: rctx.pressure,
             thermal_pressure: rctx.thermal_pressure,
+            freq_throttle: rctx.freq_throttle,
             foreground: intent == TaskIntent::Interactive,
             audit_failure_rate: rctx.audit_failure_rate,
         };

@@ -1,0 +1,10 @@
+[package]
+name = "libthreadctl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Embeddable affinity thread pool — bind workers to specific CPU cores (Android/Linux)"
+
+[dependencies]
+threadctl-core = { path = "../core" }
+libc = "0.2"
