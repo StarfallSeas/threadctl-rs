@@ -140,8 +140,7 @@ impl DecisionEngine {
 }
 
 /// CpuMigrate 策略。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MigrateAction {
     #[default]
     Observe,

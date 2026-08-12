@@ -64,7 +64,9 @@ impl AuditSummary {
 /// CLAUDE LOW-1：VecDeque + pop_front（O(1)），替换 Vec::remove(0)（O(n) 移位）。
 static AUDIT_LOG: LazyLock<Mutex<VecDeque<AuditEntry>>> =
     LazyLock::new(|| Mutex::new(VecDeque::new()));
-const AUDIT_LOG_MAX: usize = 256;
+/// 环形容量：1024（深审 L1：256 在 60s 窗口高频事件下被覆盖 → 统计低估；
+/// 1024 条 × ~40B ≈ 40KB，内存可接受——60s 窗口在 8 包真实负载下不再截断）。
+const AUDIT_LOG_MAX: usize = 1024;
 
 /// 记录一次审计（自动盖时间戳）。
 pub fn record(mut entry: AuditEntry) {
@@ -159,10 +161,10 @@ mod tests {
     fn ring_buffer_and_summary() {
         reset();
         // ① 环形上限
-        for i in 0..300 {
+        for i in 0..AUDIT_LOG_MAX + 100 {
             record(AuditEntry {
                 timestamp: 0,
-                tid: i,
+                tid: i as i32,
                 pkg: "com.x".into(),
                 requested_cpus: "0-1".into(),
                 effective_cpus: "0-1".into(),
@@ -171,8 +173,8 @@ mod tests {
             });
         }
         let s = summary();
-        assert_eq!(s.total_attempts, 256, "环形缓冲上限 256");
-        assert_eq!(s.success, 128, "300 条中偶数 150 → 环形淘汰最早 44 条后剩 128");
+        assert_eq!(s.total_attempts, AUDIT_LOG_MAX, "环形缓冲上限 {AUDIT_LOG_MAX}");
+        assert_eq!(s.success, AUDIT_LOG_MAX / 2, "超容量后偶数成功数 = 容量一半");
 
         // ② 原因计数
         reset();

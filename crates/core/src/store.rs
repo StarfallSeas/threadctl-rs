@@ -262,7 +262,7 @@ mod tests {
     fn temp_config(content: &str) -> (std::path::PathBuf, String) {
         let n = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir()
-            .join(format!("threadctl-test-{}-{n}.toml", std::process::id()));
+            .join(format!("threadctl-test-{}-{n}.kdl", std::process::id()));
         fs::write(&path, content).unwrap();
         let path_str = path.to_string_lossy().into_owned();
         (path, path_str)
@@ -270,12 +270,12 @@ mod tests {
 
     #[test]
     fn store_reload_increments_version() {
-        let (path, path_str) = temp_config("[engine]\nscan_interval = 1\n");
+        let (path, path_str) = temp_config("engine { scan-interval 1 }\n");
         let topo = CpuTopology::default();
         let store = ConfigStore::new(&path_str, topo).expect("init");
         assert_eq!(store.current().version, 1);
 
-        fs::write(&path, "[engine]\nscan_interval = 2\n").unwrap();
+        fs::write(&path, "engine { scan-interval 2 }\n").unwrap();
         let v = store.reload().expect("reload");
         assert_eq!(v, 2);
         assert_eq!(store.current().version, 2);
@@ -285,11 +285,11 @@ mod tests {
 
     #[test]
     fn store_reload_keeps_old_on_error() {
-        let (path, path_str) = temp_config("[engine]\nscan_interval = 1\n");
+        let (path, path_str) = temp_config("engine { scan-interval 1 }\n");
         let topo = CpuTopology::default();
         let store = ConfigStore::new(&path_str, topo).expect("init");
 
-        fs::write(&path, "key = 1\nkey = 2\n").unwrap(); // 重复键 — TOML 规格禁止
+        fs::write(&path, "engine { scan-interval 1\n").unwrap(); // 未闭合 — KDL 语法错误
         assert!(store.reload().is_err(), "坏配置应报错");
         assert_eq!(store.current().version, 1, "旧快照应保留");
         let _ = fs::remove_file(&path);
@@ -297,7 +297,7 @@ mod tests {
 
     #[test]
     fn store_current_is_cheap_clone() {
-        let (_, path_str) = temp_config("[engine]\nscan_interval = 1\n");
+        let (_, path_str) = temp_config("engine { scan-interval 1 }\n");
         let topo = CpuTopology::default();
         let store = ConfigStore::new(&path_str, topo).expect("init");
         let a = store.current();

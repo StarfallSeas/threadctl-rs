@@ -26,6 +26,10 @@ pub fn parse_kdl(input: &str) -> Result<(ConfigModel, DaemonConfig, EngineConfig
                     threads: HashMap::new(), thread_types: HashMap::new(),
                 });
                 if let Some(children) = node.children() {
+                    // P8.1：app 节点裸属性 = default_policy（`app "x" { cpus "0-3" }`
+                    // 等价于 `default { cpus "0-3" }`；与 profile 组合时显式覆盖模板）。
+                    // parse(node) 会跳过无名包名 entry（key=None），安全。
+                    entry.default_policy = parse(node)?;
                     for child in children.nodes() {
                         match child.name().value() {
                             "default" => { entry.default_policy = parse(child)?; }

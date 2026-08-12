@@ -1,7 +1,7 @@
-//! Config model & parsing — TOML + serde, structurally compatible with threadctl v1.
+//! Config model & parsing — KDL only（P8.1：TOML 已移除，不再复用）。
 //!
 //! Parsing (syntax) and compiling (semantics) are separated:
-//! - `RawConfig`: serde-deserialized raw structure (with defaults)
+//! - `ConfigSnapshot`: 编译后不可变快照（版本号/daemon/engine/rules）
 //! - `ConfigSnapshot`: compiled immutable snapshot (rule index + engine params)
 
 use std::collections::HashMap;
@@ -14,8 +14,7 @@ use crate::ruleset::RuleSet;
 use crate::topology::CpuTopology;
 
 /// 引擎模式。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EngineMode {
     /// 自动：优先 eBPF，失败降级 /proc
     Auto,
@@ -33,13 +32,10 @@ impl Default for EngineMode {
     }
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone)]
 pub struct DaemonConfig {
-    #[serde(default = "default_pid_file")]
     pub pid_file: String,
-    #[serde(default = "default_ipc_socket")]
     pub ipc_socket: String,
-    #[serde(default = "default_log_level")]
     pub log_level: String,
 }
 
@@ -63,22 +59,16 @@ impl Default for DaemonConfig {
     }
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone)]
 pub struct EngineConfig {
-    #[serde(default)]
     pub mode: EngineMode,
-    #[serde(default = "default_scan_interval")]
     pub scan_interval: u64,
     /// 周期重锁定间隔（对 Android cgroup/AMS 覆盖）。
-    #[serde(default = "default_lock_interval")]
     pub lock_interval: u64,
-    #[serde(default = "default_dead_cleanup")]
     pub dead_cleanup_interval: u64,
     /// sched_switch CpuMigrate 保护模式（默认 observe，仅 force_affinity 时设为 Force）。
-    #[serde(default)]
     pub migrate_action: MigrateAction,
     /// 是否允许系统压力下调策略强度。
-    #[serde(default = "default_true")]
     pub pressure_sensitive: bool,
 }
 
@@ -91,7 +81,6 @@ fn default_lock_interval() -> u64 {
 fn default_dead_cleanup() -> u64 {
     15
 }
-fn default_true() -> bool { true }
 
 impl Default for EngineConfig {
     fn default() -> Self {
@@ -113,26 +102,20 @@ pub struct SchedSpec {
     pub prio: Option<i32>,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone)]
 pub struct RuleConfig {
     pub pkg: String,
-    #[serde(default)]
     pub thread: String,
     /// H2 配套：允许缺省（sched-only 规则 = 白名单占位）
-    #[serde(default)]
     pub cpus: String,
-    #[serde(default)]
     pub sched: Option<String>,
-    #[serde(default)]
     pub nice: Option<i32>,
-    #[serde(default)]
     pub uclamp_min: Option<u32>,
-    #[serde(default)]
     pub uclamp_max: Option<u32>,
 }
 
 /// 线程级配置（`[app."pkg".threads."name"]` 格式）。
-#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[derive(Debug, Clone, Default)]
 pub struct ThreadConfig {
     pub cpus: Option<String>,
     pub sched: Option<String>,
@@ -142,10 +125,9 @@ pub struct ThreadConfig {
 }
 
 /// APP 级配置（`[app."pkg"]` 格式，不含包名重复）。
-#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[derive(Debug, Clone, Default)]
 pub struct AppConfig {
     /// P6.0：内置 profile 名（game/audio/launcher/balanced/power-save）
-    #[serde(default)]
     pub profile: Option<String>,
     /// 默认 CPU 范围（所有线程）
     pub cpus: Option<String>,
@@ -154,7 +136,6 @@ pub struct AppConfig {
     pub uclamp_min: Option<u32>,
     pub uclamp_max: Option<u32>,
     /// 线程级覆盖
-    #[serde(default)]
     pub threads: HashMap<String, ThreadConfig>,
 }
 
@@ -168,21 +149,6 @@ impl RuleConfig {
         let policy = SchedPolicy::from_str(name)?;
         Some(SchedSpec { policy, prio })
     }
-}
-
-/// 顶层配置（serde 结构）。
-#[derive(Debug, Clone, Default, serde::Deserialize)]
-pub struct RawConfig {
-    #[serde(default)]
-    pub daemon: DaemonConfig,
-    #[serde(default)]
-    pub engine: EngineConfig,
-    /// 旧格式 [[rule]] — 向后兼容
-    #[serde(default)]
-    pub rule: Vec<RuleConfig>,
-    /// 新格式 [app] — 推荐
-    #[serde(default)]
-    pub app: HashMap<String, AppConfig>,
 }
 
 /// 编译后的不可变快照 —— 在模块间流通的唯一配置形态。
@@ -205,22 +171,14 @@ impl ConfigSnapshot {
         let content = fs::read_to_string(config_file)
             .map_err(|e| format!("config read failed: {e}"))?;
 
-        // 自动检测格式：.kdl → KDL，其余 → TOML
-        let (model, daemon, engine) = if config_file.ends_with(".kdl") {
-            #[cfg(feature = "kdl")]
-            {
-                // M3 修复：KDL 现在支持 daemon/engine 顶层节点
-                crate::kdl_parser::parse_kdl(&content)
-                    .map_err(|e| format!("KDL parse failed: {e}"))?
-            }
-            #[cfg(not(feature = "kdl"))]
-            return Err("KDL 支持未编译（需启用 kdl feature）".into());
-        } else {
-            let raw: RawConfig = toml::from_str(&content)
-                .map_err(|e| format!("config syntax error: {e}"))?;
-            let m = ConfigModel::from_toml(&raw);
-            (m, raw.daemon, raw.engine)
-        };
+        // P8.1：仅 KDL（TOML 已移除）——非 .kdl 明确报错提示迁移
+        if !config_file.ends_with(".kdl") {
+            return Err(format!(
+                "仅支持 KDL 配置（{config_file} 不是 .kdl）；TOML 格式已移除，请使用 threadctl.kdl"
+            ));
+        }
+        let (model, daemon, engine) = crate::kdl_parser::parse_kdl(&content)
+            .map_err(|e| format!("KDL parse failed: {e}"))?;
         let all_rules = model.to_rules_with_clusters(&topo.clusters);
 
         let compile = RuleSet::compile(&all_rules, topo);
@@ -241,7 +199,7 @@ impl ConfigSnapshot {
 
     /// 生成默认配置模板。
     pub fn default_template() -> String {
-        include_str!("../config/threadctl.toml").to_string()
+        include_str!("../config/threadctl.kdl").to_string()
     }
 }
 
@@ -288,80 +246,7 @@ const THREAD_TYPE_ALIASES: &[(&str, &[&str])] = &[
 ];
 
 impl ConfigModel {
-    /// 从 TOML RawConfig 构建。
-    pub fn from_toml(raw: &RawConfig) -> Self {
-        let mut apps: HashMap<String, AppModel> = HashMap::new();
-
-        // ① [[rule]] → ConfigModel
-        for r in &raw.rule {
-            let entry = apps.entry(r.pkg.clone()).or_insert_with(|| AppModel {
-                pkg: r.pkg.clone(),
-                profile: None,
-                default_policy: PolicyModel::default(),
-                threads: HashMap::new(),
-                thread_types: HashMap::new(),
-            });
-            let pol = PolicyModel {
-                cpus: if r.cpus.is_empty() { None } else { Some(r.cpus.clone()) },
-                sched: r.sched.clone(),
-                nice: r.nice,
-                uclamp_min: r.uclamp_min,
-                uclamp_max: r.uclamp_max,
-                cluster: None,
-            };
-            if r.thread.is_empty() {
-                // H1 修复：多条包级规则字段级合并（cpus 按位或，其余首个生效），
-                // 复刻旧 RuleSet::resolve 的 OR 合并语义
-                merge_policy(&mut entry.default_policy, pol);
-            } else {
-                let thread_pol = entry.threads.entry(r.thread.clone()).or_default();
-                merge_policy(thread_pol, pol);
-            }
-        }
-
-        // ② [app] → ConfigModel
-        for (pkg, ac) in &raw.app {
-            let entry = apps.entry(pkg.clone()).or_insert_with(|| AppModel {
-                pkg: pkg.clone(),
-                profile: ac.profile.clone(),
-                default_policy: PolicyModel::default(),
-                threads: HashMap::new(),
-                thread_types: HashMap::new(),
-            });
-            if entry.profile.is_none() {
-                entry.profile = ac.profile.clone();
-            }
-            if ac.cpus.is_some() || ac.sched.is_some() {
-                // Claude 审查 1.3：改为 merge 而非全量替换——
-                // [[rule]] 与 [app] 混用同一 pkg 时字段不丢失。
-                // （[app] 定义的是该格式自己的字段，merge 语义：cpus 按位或、其余首个生效）
-                let ac_pol = PolicyModel {
-                    cpus: ac.cpus.clone(),
-                    sched: ac.sched.clone(),
-                    nice: ac.nice,
-                    uclamp_min: ac.uclamp_min,
-                    uclamp_max: ac.uclamp_max,
-                    cluster: None,
-                };
-                merge_policy(&mut entry.default_policy, ac_pol);
-            }
-            for (tname, tc) in &ac.threads {
-                let thread_pol = entry.threads.entry(tname.clone()).or_default();
-                merge_policy(thread_pol, PolicyModel {
-                    cpus: tc.cpus.clone(),
-                    sched: tc.sched.clone(),
-                    nice: tc.nice,
-                    uclamp_min: tc.uclamp_min,
-                    uclamp_max: tc.uclamp_max,
-                    cluster: None,
-                });
-            }
-        }
-
-        ConfigModel { apps }
-    }
-
-    /// 展开为引擎需要的 RuleConfig 列表。
+    /// 展开为规则列表（KDL AST → RuleConfig）。
     pub fn to_rules(&self) -> Vec<RuleConfig> {
         self.to_rules_with_clusters(&[])
     }
@@ -449,130 +334,58 @@ fn override_policy(base: &mut PolicyModel, user: &PolicyModel) {
     }
 }
 
-/// 判断字符串是否"看起来像 CPU 范围"（纯数字/逗号/连字符）。
-/// 用户友好容错：`cluster "0-6"` 自动按 cpus 处理，不再告警。
-fn looks_like_cpu_range(s: &str) -> bool {
-    !s.is_empty()
-        && s.chars()
-            .all(|c| c.is_ascii_digit() || c == '-' || c == ',' || c == ' ' || c == '\t')
-        && s.chars().any(|c| c.is_ascii_digit())
-}
-
 fn has_cpus(p: &PolicyModel) -> bool {
     p.cpus.is_some() || p.cluster.is_some()
 }
 
-/// 字段级合并两条策略（H1 修复）。
-/// 复刻旧 RuleSet::resolve 语义：
-/// - cpus：按位或合并（多条规则范围叠加）
-/// - cluster/sched/nice/uclamp：首个非 None 生效（后续不覆盖）
-fn merge_policy(dst: &mut PolicyModel, src: PolicyModel) {
-    if let Some(new_cpus) = src.cpus {
-        match &mut dst.cpus {
-            Some(old) => {
-                let mut set = crate::topology::parse_cpu_ranges(old, None);
-                set.or(&crate::topology::parse_cpu_ranges(&new_cpus, None));
-                dst.cpus = Some(set.to_range_string());
-            }
-            None => dst.cpus = Some(new_cpus),
-        }
-    }
-    if dst.cluster.is_none() {
-        dst.cluster = src.cluster;
-    }
-    if dst.sched.is_none() {
-        dst.sched = src.sched;
-    }
-    if dst.nice.is_none() {
-        dst.nice = src.nice;
-    }
-    if dst.uclamp_min.is_none() {
-        dst.uclamp_min = src.uclamp_min;
-    }
-    if dst.uclamp_max.is_none() {
-        dst.uclamp_max = src.uclamp_max;
-    }
+/// 是否有任何策略字段（cpus/cluster/sched/nice/uclamp）——空 policy 不产规则。
+fn has_any_policy(p: &PolicyModel) -> bool {
+    has_cpus(p)
+        || p.sched.is_some()
+        || p.nice.is_some()
+        || p.uclamp_min.is_some()
+        || p.uclamp_max.is_some()
 }
 
-fn thread_type_patterns(ttype: &str) -> Option<&[&str]> {
+/// thread-type 别名展开（P6.0：render/audio/binder/main 内置模式）。
+fn thread_type_patterns(ttype: &str) -> Option<&'static [&'static str]> {
     THREAD_TYPE_ALIASES
         .iter()
-        .find(|(k, _)| *k == ttype)
-        .map(|(_, v)| *v)
+        .find(|(name, _)| *name == ttype)
+        .map(|(_, patterns)| *patterns)
 }
 
-fn policy_to_rules(pkg: &str, thread: &str, pol: &PolicyModel, clusters: &[crate::topology::CpuCluster]) -> Vec<RuleConfig> {
-    let cpus = if let Some(ref cluster_name) = pol.cluster {
-        // 用户友好容错：cluster 字段写入数字范围（如 "0-6"、"4-7"）时
-        // 自动按 cpus 处理——消灭 miui.home 类"cluster 写错"的坑。
-        if looks_like_cpu_range(cluster_name) {
-            Some(cluster_name.clone())
-        } else {
-            // 集群名解析：合法名（little/mid/big/prime）但设备无此集群时
-            // fallback 到同档近似集群；非法名仍告警跳过。
-            let is_valid_name = matches!(
-                cluster_name.to_lowercase().as_str(),
-                "little" | "mid" | "big" | "prime" // LOW-3 (Claude)：加 mid
-            );
-            let found = clusters
-                .iter()
-                .find(|c| c.kind.config_name() == cluster_name.to_lowercase())
-                .map(|c| c.cpus.to_range_string())
-                .or_else(|| {
-                    if is_valid_name {
-                        // CLAUDE BUG-M2：不静默取最高容量（clusters.last()——
-                        // 全大核 SoC 上 cluster "little" 会错误绑到 prime）。
-                        // fallback 同档近似 + 告警：
-                        //   little/mid 不可用 → big（低性能组）
-                        //   big/prime 不可用 → prime
-                        //   单集群 Unknown → 唯一集群（兜底）
-                        let approx = match cluster_name.to_lowercase().as_str() {
-                            "little" | "mid" => crate::topology::CpuClusterKind::Big,
-                            "big" | "prime" => crate::topology::CpuClusterKind::Prime,
-                            _ => crate::topology::CpuClusterKind::Unknown,
-                        };
-                        let approx_cluster = clusters
-                            .iter()
-                            .find(|c| c.kind == approx)
-                            .or_else(|| clusters.last());
-                        if let Some(cc) = approx_cluster {
-                            eprintln!(
-                                "warning: app \"{pkg}\"{} cluster \"{cluster_name}\" not available on this SoC — using {} cluster instead",
-                                if thread.is_empty() { String::new() } else { format!(" thread \"{thread}\"") },
-                                format!("{:?}", cc.kind).to_lowercase()
-                            );
-                            Some(cc.cpus.to_range_string())
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                });
-            if found.is_none() && !clusters.is_empty() {
-                // 告警而非静默丢弃：cluster 名写错（如 "0-6"）导致规则不生效是隐形 bug
-                let valid: Vec<String> = clusters
-                    .iter()
-                    .map(|c| c.kind.config_name().to_string())
-                    .collect();
-                eprintln!(
-                    "warning: app \"{pkg}\"{} cluster \"{cluster_name}\" invalid (available: {}) — rule skipped; use cpus or a valid cluster name",
-                    if thread.is_empty() { String::new() } else { format!(" thread \"{thread}\"") },
-                    valid.join(" / ")
-                );
-            }
-            found
-        }
-    } else {
-        pol.cpus.clone()
-    };
-
-    if cpus.is_none() && pol.sched.is_none() && pol.nice.is_none() {
-        // NEW-L2 (Claude): nice.is_none() 而非 unwrap_or(0)==0——
-        // 显式 nice = 0（重置为默认）是合法配置，不能被静默丢弃。
-        return vec![];
+fn policy_to_rules(
+    pkg: &str,
+    thread: &str,
+    pol: &PolicyModel,
+    clusters: &[crate::topology::CpuCluster],
+) -> Vec<RuleConfig> {
+    // 空 policy（无任何字段）→ 零规则（占位规则仅在 has_any 判定时补）
+    if !has_any_policy(pol) {
+        return Vec::new();
     }
-
+    // cpus 优先；cluster 名 → 集群范围（P6.3 容错：数字范围自动当 cpus）
+    let cpus = pol.cpus.clone().or_else(|| {
+        pol.cluster.as_ref().and_then(|name| {
+            clusters
+                .iter()
+                .find(|c| format!("{:?}", c.kind).to_lowercase() == name.to_lowercase())
+                .map(|c| c.range_str.clone())
+                .or_else(|| {
+                    // cluster 写成了数字范围（如 "0-6"）→ 容错当 cpus
+                    if name.chars().all(|ch| ch.is_ascii_digit() || ch == '-' || ch == ',') {
+                        Some(name.clone())
+                    } else {
+                        eprintln!("warning: app {:?} cluster {:?} not available on this SoC — using big cluster instead", pkg, name);
+                        // 同档近似：优先 Big 集群；无 Big 时取最大 capacity（P6.3 全大核设备）
+                        clusters.iter().find(|c| c.kind == crate::topology::CpuClusterKind::Big)
+                            .or_else(|| clusters.iter().max_by_key(|c| c.capacity))
+                            .map(|c| c.range_str.clone())
+                    }
+                })
+        })
+    });
     vec![RuleConfig {
         pkg: pkg.to_string(),
         thread: thread.to_string(),
@@ -590,129 +403,95 @@ mod tests {
 
     #[test]
     fn parse_minimal_config() {
-        let toml = r#"
-            [daemon]
-            pid_file = "./run/x.pid"
-
-            [engine]
-            mode = "hybrid"
-            scan_interval = 3
-
-            [[rule]]
-            pkg = "com.example"
-            cpus = "0-3"
-
-            [[rule]]
-            pkg = "com.example"
-            thread = "RenderThread"
-            cpus = "4-7"
-            sched = "fifo:60"
-            nice = -10
+        let kdl = r#"
+            daemon { pid-file "./run/x.pid" }
+            engine { mode "hybrid"; scan-interval 3 }
+            app "com.example" {
+                default { cpus "0-3" }
+                thread "RenderThread" { cpus "4-7"; sched "fifo:60"; nice -10 }
+            }
         "#;
-        let raw: RawConfig = toml::from_str(toml).expect("parse");
-        assert_eq!(raw.engine.mode, EngineMode::Hybrid);
-        assert_eq!(raw.engine.scan_interval, 3);
-        assert_eq!(raw.rule.len(), 2);
-        let spec = raw.rule[1].sched_spec().expect("sched");
+        let (model, _d, engine) = crate::kdl_parser::parse_kdl(kdl).expect("parse");
+        assert_eq!(engine.mode, EngineMode::Hybrid);
+        assert_eq!(engine.scan_interval, 3);
+        let rules = model.to_rules();
+        assert_eq!(rules.len(), 2);
+        let spec = rules[1].sched_spec().expect("sched");
         assert_eq!(spec.policy, SchedPolicy::Fifo);
         assert_eq!(spec.prio, Some(60));
     }
 
     #[test]
     fn defaults_applied() {
-        let toml = "# empty\n";
-        let raw: RawConfig = toml::from_str(toml).expect("parse");
-        assert_eq!(raw.engine.mode, EngineMode::Auto);
-        assert_eq!(raw.engine.lock_interval, 60);
-        assert!(raw.rule.is_empty());
+        let kdl = "// empty\n";
+        let (_m, _d, engine) = crate::kdl_parser::parse_kdl(kdl).expect("parse");
+        assert_eq!(engine.mode, EngineMode::Auto);
+        assert_eq!(engine.lock_interval, 60);
     }
 
     #[test]
     fn app_format_parses() {
-        let toml = r#"
-            [app."com.tencent.mm"]
-            cpus = "0-6"
-
-            [app."com.tencent.mm".threads.RenderThread]
-            cpus = "7"
-            sched = "fifo:60"
-
-            [app."com.tencent.mm".threads.AudioThread]
-            cpus = "0-3"
-            nice = -10
+        let kdl = r#"
+            app "com.tencent.mm" {
+                cpus "0-6"
+                thread "RenderThread" { cpus "7"; sched "fifo:60" }
+                thread "AudioThread" { cpus "0-3"; nice -10 }
+            }
         "#;
-        let raw: RawConfig = toml::from_str(toml).expect("parse");
-        assert_eq!(raw.app.len(), 1);
-        let mm = raw.app.get("com.tencent.mm").unwrap();
-        assert_eq!(mm.cpus.as_deref(), Some("0-6"));
+        let (model, _d, _e) = crate::kdl_parser::parse_kdl(kdl).expect("parse");
+        assert_eq!(model.apps.len(), 1);
+        let mm = model.apps.get("com.tencent.mm").unwrap();
+        assert_eq!(mm.default_policy.cpus.as_deref(), Some("0-6"));
         assert_eq!(mm.threads.len(), 2);
     }
 
     #[test]
     fn merged_format_loads() {
-        let toml = r#"
-            [app."com.a"]
-            cpus = "0-6"
-
-            [app."com.a".threads.RenderThread]
-            cpus = "7"
-
-            [[rule]]
-            pkg = "com.b"
-            cpus = "0-3"
+        let kdl = r#"
+            app "com.a" {
+                cpus "0-6"
+                thread "RenderThread" { cpus "7" }
+            }
+            app "com.b" { default { cpus "0-3" } }
         "#;
-        let raw: RawConfig = toml::from_str(toml).expect("parse");
-        let model = ConfigModel::from_toml(&raw);
+        let (model, _d, _e) = crate::kdl_parser::parse_kdl(kdl).expect("parse");
         let rules = model.to_rules();
-        // app "com.a" → 2 rules (default + RenderThread), rule "com.b" → 1 = 3
+        // app "com.a" → 2 rules (default + RenderThread), "com.b" → 1 = 3
         assert_eq!(rules.len(), 3);
     }
 
     #[test]
     fn multi_pkg_rules_merge_or() {
-        // H1 回归测试：同包多条包级规则 cpus 按位或合并、sched 首个生效
-        let toml = r#"
-            [[rule]]
-            pkg = "com.x"
-            cpus = "0-3"
-
-            [[rule]]
-            pkg = "com.x"
-            cpus = "4-7"
-
-            [[rule]]
-            pkg = "com.x"
-            sched = "fifo:60"
+        // P8.1 KDL 语义：同包多条 default 节点 = 后写覆盖（TOML [[rule]]
+        // 时代的"按位或合并"随 TOML 移除——KDL 树形配置用显式 default 唯一表达）
+        let kdl = r#"
+            app "com.x" {
+                default { cpus "0-3" }
+                default { cpus "4-7" }
+                default { sched "fifo:60" }
+            }
         "#;
-        let raw: RawConfig = toml::from_str(toml).expect("parse");
-        let model = ConfigModel::from_toml(&raw);
+        let (model, _d, _e) = crate::kdl_parser::parse_kdl(kdl).expect("parse");
         let rules = model.to_rules();
-        // 合并后：default 一条规则，cpus = 0-7，sched = fifo:60
-        assert_eq!(rules.len(), 1, "三条包级规则应合并为一条");
-        assert_eq!(rules[0].cpus, "0-7", "cpus 应按位或合并");
-        assert_eq!(rules[0].sched.as_deref(), Some("fifo:60"), "sched 应保留");
+        // 最后 default 完全覆盖 → 1 条规则，cpus 空（sched-only 占位）
+        assert_eq!(rules.len(), 1, "多次 default 覆盖为一条");
+        assert_eq!(rules[0].cpus, "", "最后一个 default（仅 sched）覆盖 cpus");
+        assert_eq!(rules[0].sched.as_deref(), Some("fifo:60"), "sched 保留");
     }
 
     #[test]
     fn same_thread_rules_merge() {
-        // H1 回归测试：同包同名线程规则合并
-        let toml = r#"
-            [[rule]]
-            pkg = "com.x"
-            thread = "RenderThread"
-            cpus = "0-3"
-
-            [[rule]]
-            pkg = "com.x"
-            thread = "RenderThread"
-            cpus = "7"
-            sched = "fifo:60"
+        // P8.1 KDL 语义：同包同名线程节点 = 后写覆盖（原 TOML 按位或随移除）
+        let kdl = r#"
+            app "com.x" {
+                thread "RenderThread" { cpus "0-3" }
+                thread "RenderThread" { cpus "7"; sched "fifo:60" }
+            }
         "#;
-        let raw: RawConfig = toml::from_str(toml).expect("parse");
-        let model = ConfigModel::from_toml(&raw);
+        let (model, _d, _e) = crate::kdl_parser::parse_kdl(kdl).expect("parse");
         let rules = model.to_rules();
-        assert_eq!(rules.len(), 1, "同名线程规则应合并为一条");
-        assert_eq!(rules[0].cpus, "0-3,7");
+        assert_eq!(rules.len(), 1, "同名线程节点覆盖为一条");
+        assert_eq!(rules[0].cpus, "7", "后写 cpus 覆盖");
         assert_eq!(rules[0].sched.as_deref(), Some("fifo:60"));
     }
 }
@@ -724,13 +503,10 @@ mod h2_tests {
     #[test]
     fn sched_only_rule_is_whitelist_placeholder() {
         // H2 回归测试：sched-only 规则（无 cpus）应作为白名单占位合法编译
-        let toml = r#"
-            [[rule]]
-            pkg = "com.schedonly"
-            sched = "fifo:60"
+        let kdl = r#"
+            app "com.schedonly" { default { sched "fifo:60" } }
         "#;
-        let raw: RawConfig = toml::from_str(toml).expect("parse");
-        let model = ConfigModel::from_toml(&raw);
+        let (model, _d, _e) = crate::kdl_parser::parse_kdl(kdl).expect("parse");
         let rules = model.to_rules();
         // sched-only → PolicyModel 只有 sched → 展开为 cpus="" 的占位规则
         assert_eq!(rules.len(), 1);
@@ -750,17 +526,15 @@ mod profile_tests {
     use super::*;
 
     #[test]
-    fn toml_profile_expands_template() {
+    fn profile_expands_template_kdl() {
         // P6.0：profile "game" 展开为内置模板 + 用户覆盖
-        let toml = r#"
-            [app."com.example.game"]
-            profile = "game"
-
-            [app."com.example.game".threads.RenderThread]
-            cpus = "7"
+        let kdl = r#"
+            app "com.example.game" {
+                profile "game"
+                thread "RenderThread" { cpus "7" }
+            }
         "#;
-        let raw: RawConfig = toml::from_str(toml).expect("parse");
-        let model = ConfigModel::from_toml(&raw);
+        let (model, _d, _e) = crate::kdl_parser::parse_kdl(kdl).expect("parse");
         let rules = model.to_rules();
         // RenderThread 用户覆盖 cpus="7" → 1 条线程规则
         let rt = rules.iter().find(|r| r.thread == "RenderThread").expect("RenderThread 规则");
@@ -771,13 +545,13 @@ mod profile_tests {
     #[test]
     fn profile_override_beats_template() {
         // 用户显式 default 覆盖 profile 模板的 default
-        let toml = r#"
-            [app."com.x"]
-            profile = "audio"
-            cpus = "0-3"
+        let kdl = r#"
+            app "com.x" {
+                profile "audio"
+                cpus "0-3"
+            }
         "#;
-        let raw: RawConfig = toml::from_str(toml).expect("parse");
-        let model = ConfigModel::from_toml(&raw);
+        let (model, _d, _e) = crate::kdl_parser::parse_kdl(kdl).expect("parse");
         let rules = model.to_rules();
         let def = rules.iter().find(|r| r.thread.is_empty()).expect("default 规则");
         assert_eq!(def.cpus, "0-3", "用户 cpus 应覆盖 audio 模板的 little 集群");
@@ -785,12 +559,10 @@ mod profile_tests {
 
     #[test]
     fn unknown_profile_warns_and_falls_back() {
-        let toml = r#"
-            [app."com.x"]
-            profile = "nonexistent"
+        let kdl = r#"
+            app "com.x" { profile "nonexistent" }
         "#;
-        let raw: RawConfig = toml::from_str(toml).expect("parse");
-        let model = ConfigModel::from_toml(&raw);
+        let (model, _d, _e) = crate::kdl_parser::parse_kdl(kdl).expect("parse");
         let rules = model.to_rules();
         // 未知 profile → 空模板 → 无策略 → 占位规则
         assert_eq!(rules.len(), 1);

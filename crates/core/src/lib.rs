@@ -21,7 +21,6 @@ pub mod debug;
 pub mod engine;
 pub mod event;
 pub mod foreground;
-#[cfg(feature = "kdl")]
 pub mod kdl_parser;
 pub mod merge;
 pub mod observe;

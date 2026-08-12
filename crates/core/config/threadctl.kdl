@@ -1,0 +1,37 @@
+// threadctl-rs 默认配置模板（KDL——P8.1 起仅支持 KDL，TOML 已移除）
+//
+// 语法：
+//   - 字符串用双引号 "..."；// 单行注释
+//   - app 内：default / thread "名" / thread-type "别名"
+//   - 字段：cpus、cluster、sched、priority、nice、uclamp-min、uclamp-max
+//   - thread-type 内置别名：render→*RenderThread*,*GL*,*Vk*；audio→*Audio*,*Sound*；
+//     binder→*Binder:*；main→*main*
+
+daemon {
+    pid-file "./run/threadctl.pid"
+    ipc-socket "./run/threadctl.sock"
+    log-level "info"            // trace | debug | info | warn | error
+}
+
+engine {
+    mode "auto"                 // auto | ebpf | proc | hybrid
+    scan-interval 2             // 秒；/proc 轮询间隔
+    lock-interval 60            // 秒；周期重锁定（对抗 AMS 覆盖；0=仅事件驱动）
+    dead-cleanup-interval 15    // 秒；死进程清理间隔
+}
+
+// ── 推荐配置格式：app + default / thread ──────────────────
+// app "com.example.game" {
+//     default { cpus "0-6" }        // 默认所有线程
+//     thread "RenderThread" { cpus "7"; sched "fifo"; priority 60 }
+//     thread "AudioThread" { cpus "0-3"; nice -5 }
+// }
+//
+// 可用 profile：game / chat / video / launcher / audio / balanced / power-save
+// app "com.example.game" {
+//     profile "game"
+//     thread "RenderThread" { cluster "prime"; sched "fifo"; priority 60 }
+// }
+
+// Magisk 模块建议使用绝对路径：
+// daemon { pid-file "/data/adb/modules/threadctl/run/threadctl.pid"; ipc-socket "/data/adb/modules/threadctl/run/threadctl.sock" }

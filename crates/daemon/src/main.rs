@@ -186,7 +186,7 @@ fn lock_tracker(t: &Mutex<StateTracker>) -> std::sync::MutexGuard<'_, StateTrack
 fn print_help(prog: &str) {
     println!("Usage: {prog} [OPTIONS]");
     println!("Options:");
-    println!("  -c <file>     Config file (default: ./threadctl.toml)");
+    println!("  -c <file>     Config file (default: ./threadctl.kdl)");
     println!("  -s <secs>     Scan interval in seconds (default: 2)");
     println!("  --debug       Verbose debug logging (or env TC_DEBUG=1)");
     println!("  -v            Print version");
@@ -197,7 +197,7 @@ fn main() {
     let args: Vec<String> = env::args().collect();
     let prog = &args[0];
 
-    let mut config_file = String::from("./threadctl.toml");
+    let mut config_file = String::from("./threadctl.kdl");
     let mut scan_interval: u64 = 2;
     let mut dry_run = false;
 
